@@ -31,4 +31,7 @@ package:
 app:
 	$(UNINJECT) ./build-app.sh
 
-.PHONY: all build clean clean-all package app bootstrap
+install:
+	$(UNINJECT) ./ndock install
+
+.PHONY: all build clean clean-all package app bootstrap install

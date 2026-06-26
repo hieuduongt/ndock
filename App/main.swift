@@ -46,7 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMarginField.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         windowMarginStepper = NSStepper(frame: NSRect(x: 298, y: y - 2, width: 24, height: 22))
         windowMarginStepper.minValue = 0
-        windowMarginStepper.maxValue = 50
+        windowMarginStepper.maxValue = 100
         windowMarginStepper.increment = 1
         windowMarginStepper.target = self
         windowMarginStepper.action = #selector(windowMarginStepped)
@@ -60,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dockMarginField.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         dockMarginStepper = NSStepper(frame: NSRect(x: 298, y: y - 2, width: 24, height: 22))
         dockMarginStepper.minValue = 0
-        dockMarginStepper.maxValue = 50
+        dockMarginStepper.maxValue = 100
         dockMarginStepper.increment = 1
         dockMarginStepper.target = self
         dockMarginStepper.action = #selector(dockMarginStepped)

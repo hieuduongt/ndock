@@ -3,64 +3,55 @@
 #import <mach-o/dyld.h>
 #import <math.h>
 #import <string.h>
-#import <unistd.h>
 #import <dlfcn.h>
-#import <dispatch/dispatch.h>
 #import "NDConfig.h"
 
 static const CGFloat kNDNearFullTol = 8.0;
+static const CGFloat kNDPinTol = 0.5;
 
-static const void *kNDMarginLockKey = &kNDMarginLockKey;
-
-typedef struct {
-    BOOL active;
-    CGRect insetFrame;
-} NDMarginLock;
-
-typedef void (*set_frame_fn)(id, SEL, CGRect, BOOL);
-typedef void (*set_frame_anim_fn)(id, SEL, CGRect, BOOL, BOOL);
+typedef void (*set_frame_animate_fn)(id, SEL, CGRect, BOOL, BOOL);
 typedef void (*zoom_to_frame_fn)(id, SEL, CGRect, BOOL, BOOL, NSInteger);
-typedef void (*zoom_to_screen_fn)(id, SEL, id, BOOL);
-typedef void (*zoom_fill_fn)(id, SEL, id);
-typedef void (*zoom_fn)(id, SEL, id);
-typedef void (*gesture_fn)(id, SEL, id);
+typedef void (*set_frame_fn)(id, SEL, CGRect, BOOL);
+typedef void (*set_frame_common_fn)(id, SEL, CGRect, BOOL, BOOL);
 typedef CGRect (*std_frame_fn)(id, SEL);
 typedef CGRect (*std_screen_fn)(id, SEL, id, BOOL);
 typedef CGRect (*constrain_fn)(id, SEL, CGRect, id);
 
+static set_frame_animate_fn orig_setFrameAnimate = NULL;
 static set_frame_fn orig_setFrameDisplay = NULL;
-static set_frame_anim_fn orig_setFrameDisplayAnimate = NULL;
-static zoom_to_frame_fn orig_zoomToFrame = NULL;
-static zoom_to_screen_fn orig_zoomToScreen = NULL;
-static zoom_fill_fn orig_zoomFill = NULL;
-static zoom_fn orig_zoom = NULL;
-static zoom_fn orig_performZoom = NULL;
-static gesture_fn orig_doubleTapGesture = NULL;
 static std_frame_fn orig_standardFrame = NULL;
 static std_screen_fn orig_standardFrameForScreen = NULL;
 static constrain_fn orig_constrainFrame = NULL;
+static zoom_to_frame_fn orig_zoomToFrame = NULL;
+static set_frame_common_fn orig_setFrameCommon = NULL;
 
-static IMP gSetFrameHookIMP = NULL;
-static IMP gSetFrameAnimHookIMP = NULL;
+static IMP gSetFrameAnimateHookIMP = NULL;
+static IMP gSetFrameCommonHookIMP = NULL;
 static IMP gConstrainHookIMP = NULL;
-static IMP gZoomHookIMP = NULL;
-static IMP gPerformZoomHookIMP = NULL;
+static IMP gSetFrameHookIMP = NULL;
+static IMP gZoomToFrameHookIMP = NULL;
+static IMP gStandardFrameHookIMP = NULL;
+static IMP gStandardFrameForScreenHookIMP = NULL;
 
-static NSMutableSet<NSString *> *gHookedSetFrameClasses = nil;
-static NSMutableSet<NSString *> *gHookedSetFrameAnimClasses = nil;
-static NSMutableSet<NSString *> *gHookedConstrainClasses = nil;
-static NSMutableSet<NSString *> *gHookedZoomClasses = nil;
-static NSMutableSet<NSString *> *gHookedPerformZoomClasses = nil;
-
-static NSMutableDictionary<NSString *, NSValue *> *gSubclassSetFrameOrig = nil;
-static NSMutableDictionary<NSString *, NSValue *> *gSubclassSetFrameAnimOrig = nil;
+static Class gNSWindowClass = NULL;
+static NSMutableSet<NSString *> *gHookedMethods = nil;
 static NSMutableDictionary<NSString *, NSValue *> *gSubclassConstrainOrig = nil;
-static NSMutableDictionary<NSString *, NSValue *> *gSubclassZoomOrig = nil;
-static NSMutableDictionary<NSString *, NSValue *> *gSubclassPerformZoomOrig = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gSubclassSetFrameOrig = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gSubclassZoomToFrameOrig = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gSubclassStandardFrameOrig = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gSubclassStandardFrameForScreenOrig = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gSubclassSetFrameAnimateOrig = nil;
+static NSMutableDictionary<NSString *, NSValue *> *gSubclassSetFrameCommonOrig = nil;
+static NSMutableSet<NSString *> *gFullyHookedClasses = nil;
 
-static __thread BOOL gNDInSetFrame = NO;
+static BOOL gNDWindowMarginActive = NO;
+static BOOL gNDSwiftUIHooked = NO;
+
 static __thread BOOL gNDInConstrain = NO;
-static __thread BOOL gNDInZoom = NO;
+static __thread BOOL gNDInStandardFrame = NO;
+static __thread BOOL gNDInSetFrame = NO;
+static __thread BOOL gNDInSetFrameAnimate = NO;
+static __thread BOOL gNDInSetFrameCommon = NO;
 
 typedef const char **(*copy_class_names_fn)(const char *, unsigned int *);
 static copy_class_names_fn gCopyClassNamesForImage = NULL;
@@ -69,14 +60,31 @@ static const char *kNDKnownWindowClasses[] = {
     "Window", "BrowserWindow", "BrowserWKWindow", NULL
 };
 
-static BOOL NDIsDockProcess(void) {
-    const char *p = getprogname();
-    return p && strcmp(p, "Dock") == 0;
+static void NDHookWindowSubclass(Class cls);
+
+static inline BOOL NDMarginEnabled(void) {
+    return NDWindowMarginPerSide() > 0;
 }
 
 static NSScreen *NDWindowScreen(id self) {
     NSScreen *screen = [(NSWindow *)self screen];
     return screen ?: NSScreen.mainScreen;
+}
+
+static BOOL NDShouldHookWindow(id self) {
+    if (!gNDWindowMarginActive) return NO;
+    if (![self isKindOfClass:gNSWindowClass]) return NO;
+    NSWindow *win = (NSWindow *)self;
+    NSWindowStyleMask mask = win.styleMask;
+    return (mask & NSWindowStyleMaskTitled) && ![win isKindOfClass:[NSPanel class]];
+}
+
+static IMP NDSubclassOrigIMP(id self, NSMutableDictionary *map, IMP fallback) {
+    if (map) {
+        NSValue *v = map[NSStringFromClass(object_getClass(self))];
+        if (v) return [v pointerValue];
+    }
+    return fallback;
 }
 
 static BOOL NDFrameMatches(CGRect a, CGRect b, CGFloat tol) {
@@ -90,352 +98,318 @@ static BOOL NDIsNearFull(CGRect frame, CGRect visible) {
     return NDFrameMatches(frame, visible, kNDNearFullTol);
 }
 
-static CGRect NDInsetVisibleFrame(CGRect visible, CGFloat margin) {
+static BOOL NDTouchesLeftEdge(CGRect frame, CGRect visible, CGFloat margin) {
+    return frame.origin.x < visible.origin.x + margin - 0.5;
+}
+
+static BOOL NDTouchesRightEdge(CGRect frame, CGRect visible, CGFloat margin) {
+    return (frame.origin.x + frame.size.width) > (visible.origin.x + visible.size.width - margin + 0.5);
+}
+
+static BOOL NDTouchesBottomEdge(CGRect frame, CGRect visible, CGFloat margin) {
+    return frame.origin.y < visible.origin.y + margin - 0.5;
+}
+
+static BOOL NDTouchesTopEdge(CGRect frame, CGRect visible, CGFloat margin) {
+    return (frame.origin.y + frame.size.height) > (visible.origin.y + visible.size.height - margin + 0.5);
+}
+
+static BOOL NDFrameHasProperMargins(CGRect frame, CGRect visible, CGFloat margin) {
+    return !NDTouchesLeftEdge(frame, visible, margin) &&
+           !NDTouchesRightEdge(frame, visible, margin) &&
+           !NDTouchesBottomEdge(frame, visible, margin) &&
+           !NDTouchesTopEdge(frame, visible, margin);
+}
+
+static CGRect NDMaxAllowedFrame(NSScreen *screen, CGFloat margin) {
+    if (!screen) return CGRectZero;
+    CGRect visible = screen.visibleFrame;
     return CGRectMake(visible.origin.x + margin,
                       visible.origin.y + margin,
                       visible.size.width - 2.0 * margin,
                       visible.size.height - 2.0 * margin);
 }
 
-static NDMarginLock NDGetLock(id self) {
-    NSValue *val = objc_getAssociatedObject(self, kNDMarginLockKey);
-    NDMarginLock lock = {0};
-    if (val) [val getValue:&lock];
-    return lock;
-}
-
-static void NDSetLock(id self, CGRect insetFrame) {
-    NDMarginLock lock = { .active = YES, .insetFrame = insetFrame };
-    objc_setAssociatedObject(self, kNDMarginLockKey,
-                             [NSValue valueWithBytes:&lock objCType:@encode(NDMarginLock)],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-static void NDClearLock(id self) {
-    NDMarginLock lock = NDGetLock(self);
-    lock.active = NO;
-    objc_setAssociatedObject(self, kNDMarginLockKey,
-                             [NSValue valueWithBytes:&lock objCType:@encode(NDMarginLock)],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-static BOOL NDMarginLockActive(id self) {
-    return NDGetLock(self).active;
-}
-
-static CGRect NDMarginLockedFrame(id self) {
-    return NDGetLock(self).insetFrame;
-}
-
-static void NDPrepareFillLock(id self) {
-    NSScreen *screen = NDWindowScreen(self);
-    if (!screen || NDWindowMarginPerSide() <= 0) return;
-    NDSetLock(self, NDInsetVisibleFrame(screen.visibleFrame, NDWindowMarginPerSide()));
-}
-
-static set_frame_fn NDOrigSetFrameForObject(id self) {
-    if (gSubclassSetFrameOrig) {
-        NSValue *v = gSubclassSetFrameOrig[NSStringFromClass(object_getClass(self))];
-        if (v) return (set_frame_fn)[v pointerValue];
+static CGRect NDApplyEdgeMargins(CGRect frame, CGRect visible, CGFloat margin) {
+    CGRect out = frame;
+    if (NDTouchesLeftEdge(frame, visible, margin)) {
+        out.origin.x = visible.origin.x + margin;
+        out.size.width = (frame.origin.x + frame.size.width) - out.origin.x;
     }
-    return orig_setFrameDisplay;
-}
-
-static set_frame_anim_fn NDOrigSetFrameAnimForObject(id self) {
-    if (gSubclassSetFrameAnimOrig) {
-        NSValue *v = gSubclassSetFrameAnimOrig[NSStringFromClass(object_getClass(self))];
-        if (v) return (set_frame_anim_fn)[v pointerValue];
+    if (NDTouchesRightEdge(frame, visible, margin))
+        out.size.width = visible.origin.x + visible.size.width - margin - out.origin.x;
+    if (NDTouchesBottomEdge(frame, visible, margin)) {
+        out.origin.y = visible.origin.y + margin;
+        out.size.height = (frame.origin.y + frame.size.height) - out.origin.y;
     }
-    return orig_setFrameDisplayAnimate;
+    if (NDTouchesTopEdge(frame, visible, margin))
+        out.size.height = visible.origin.y + visible.size.height - margin - out.origin.y;
+    return out;
 }
 
-static constrain_fn NDOrigConstrainForObject(id self) {
-    if (gSubclassConstrainOrig) {
-        NSValue *v = gSubclassConstrainOrig[NSStringFromClass(object_getClass(self))];
-        if (v) return (constrain_fn)[v pointerValue];
-    }
-    return orig_constrainFrame;
-}
-
-static zoom_fn NDOrigZoomForObject(id self) {
-    if (gSubclassZoomOrig) {
-        NSValue *v = gSubclassZoomOrig[NSStringFromClass(object_getClass(self))];
-        if (v) return (zoom_fn)[v pointerValue];
-    }
-    return orig_zoom;
-}
-
-static zoom_fn NDOrigPerformZoomForObject(id self) {
-    if (gSubclassPerformZoomOrig) {
-        NSValue *v = gSubclassPerformZoomOrig[NSStringFromClass(object_getClass(self))];
-        if (v) return (zoom_fn)[v pointerValue];
-    }
-    return orig_performZoom;
-}
-
-static CGRect NDApplyMarginIntent(id self, CGRect frame) {
-    if (NDWindowMarginPerSide() <= 0) return frame;
-    NSScreen *screen = NDWindowScreen(self);
-    if (!screen) return frame;
+static CGRect NDCapFrame(CGRect frame, NSScreen *screen, BOOL allowEdges) {
+    CGFloat margin = NDWindowMarginPerSide();
+    if (!screen || margin <= 0) return frame;
     CGRect visible = screen.visibleFrame;
-    if (!NDIsNearFull(frame, visible)) return frame;
-    CGRect inset = NDInsetVisibleFrame(visible, NDWindowMarginPerSide());
-    NDSetLock(self, inset);
-    return inset;
-}
-
-static CGRect NDAdjustSetFrame(id self, CGRect frame) {
-    if (NDWindowMarginPerSide() <= 0) return frame;
-    NSScreen *screen = NDWindowScreen(self);
-    if (!screen) return frame;
-
-    CGRect visible = screen.visibleFrame;
-    CGRect inset = NDInsetVisibleFrame(visible, NDWindowMarginPerSide());
-
-    if (NDMarginLockActive(self)) {
-        if (NDIsNearFull(frame, visible))
-            return NDMarginLockedFrame(self);
-        if (frame.size.width < visible.size.width - 30.0 &&
-            frame.size.height < visible.size.height - 30.0)
-            NDClearLock(self);
-        return frame;
-    }
-
-    if (NDIsNearFull(frame, visible)) {
-        NDSetLock(self, inset);
-        return inset;
+    if (NDIsNearFull(frame, visible))
+        return NDMaxAllowedFrame(screen, margin);
+    if (allowEdges && !NDFrameHasProperMargins(frame, visible, margin)) {
+        if (NDTouchesLeftEdge(frame, visible, margin) ||
+            NDTouchesRightEdge(frame, visible, margin) ||
+            NDTouchesBottomEdge(frame, visible, margin) ||
+            NDTouchesTopEdge(frame, visible, margin))
+            return NDApplyEdgeMargins(frame, visible, margin);
     }
     return frame;
 }
 
-static CGRect NDAdjustConstrainOutput(id self, CGRect frame, CGRect input, id screen) {
-    if (NDWindowMarginPerSide() <= 0) return frame;
+static Class NDHookableWindowClass(id self) {
+    Class cls = object_getClass(self);
+    while (cls && cls != gNSWindowClass) {
+        if (strncmp(class_getName(cls), "NSKVONotifying_", 15) != 0)
+            return cls;
+        cls = class_getSuperclass(cls);
+    }
+    return NULL;
+}
+
+static void NDEnsureHookCollections(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gHookedMethods = [NSMutableSet set];
+        gSubclassSetFrameAnimateOrig = [NSMutableDictionary new];
+        gSubclassConstrainOrig = [NSMutableDictionary new];
+        gSubclassSetFrameOrig = [NSMutableDictionary new];
+        gSubclassZoomToFrameOrig = [NSMutableDictionary new];
+        gSubclassStandardFrameOrig = [NSMutableDictionary new];
+        gSubclassStandardFrameForScreenOrig = [NSMutableDictionary new];
+        gSubclassSetFrameCommonOrig = [NSMutableDictionary new];
+        gFullyHookedClasses = [NSMutableSet set];
+    });
+}
+
+static void NDEnsureSubclassHooked(id self) {
+    Class cls = object_getClass(self);
+    if (cls == gNSWindowClass || !gSetFrameHookIMP) return;
+    cls = NDHookableWindowClass(self);
+    if (!cls) return;
+    NDEnsureHookCollections();
+    NSString *name = NSStringFromClass(cls);
+    if ([gFullyHookedClasses containsObject:name]) return;
+    NDHookWindowSubclass(cls);
+    [gFullyHookedClasses addObject:name];
+}
+
+static CGRect nd_standardFrame(id self, SEL _cmd) {
+    std_frame_fn orig = (std_frame_fn)NDSubclassOrigIMP(self, gSubclassStandardFrameOrig,
+                                                       (IMP)orig_standardFrame);
+    if (!orig || !NDShouldHookWindow(self) || gNDInStandardFrame)
+        return orig ? orig(self, _cmd) : CGRectZero;
+    gNDInStandardFrame = YES;
+    CGRect natural = orig(self, _cmd);
+    gNDInStandardFrame = NO;
+    return NDCapFrame(natural, NDWindowScreen(self), YES);
+}
+
+static CGRect nd_standardFrameForScreen(id self, SEL _cmd, id screen, BOOL moveToIPad) {
+    std_screen_fn orig = (std_screen_fn)NDSubclassOrigIMP(self, gSubclassStandardFrameForScreenOrig,
+                                                          (IMP)orig_standardFrameForScreen);
+    if (!orig || !NDShouldHookWindow(self) || gNDInStandardFrame)
+        return orig ? orig(self, _cmd, screen, moveToIPad) : CGRectZero;
+    gNDInStandardFrame = YES;
+    CGRect natural = orig(self, _cmd, screen, moveToIPad);
+    gNDInStandardFrame = NO;
     NSScreen *scr = [(id)screen isKindOfClass:[NSScreen class]] ? (NSScreen *)screen : NDWindowScreen(self);
-    if (!scr) return frame;
-    CGRect visible = scr.visibleFrame;
+    return NDCapFrame(natural, scr, YES);
+}
 
-    if (NDMarginLockActive(self)) {
-        if (NDIsNearFull(input, visible) || NDIsNearFull(frame, visible))
-            return NDMarginLockedFrame(self);
-        return frame;
-    }
+static void nd_zoomToFrame(id self, SEL _cmd, CGRect frame, BOOL willChangeScreens,
+                           BOOL moveToIPad, NSInteger zoomState) {
+    zoom_to_frame_fn orig = (zoom_to_frame_fn)NDSubclassOrigIMP(self, gSubclassZoomToFrameOrig,
+                                                                (IMP)orig_zoomToFrame);
+    if (!orig) return;
+    if (NDShouldHookWindow(self))
+        frame = NDCapFrame(frame, NDWindowScreen(self), YES);
+    orig(self, _cmd, frame, willChangeScreens, moveToIPad, zoomState);
+}
 
-    if (NDIsNearFull(frame, visible)) {
-        CGRect inset = NDInsetVisibleFrame(visible, NDWindowMarginPerSide());
-        NDSetLock(self, inset);
-        return inset;
-    }
+static BOOL NDPinnedToVisibleBottom(CGRect frame, CGRect visible) {
+    return frame.origin.y <= visible.origin.y + kNDPinTol;
+}
+
+static BOOL NDPinnedToVisibleTop(CGRect frame, CGRect visible) {
+    return (frame.origin.y + frame.size.height) >= (visible.origin.y + visible.size.height - kNDPinTol);
+}
+
+static BOOL NDPinnedToVisibleLeft(CGRect frame, CGRect visible) {
+    return frame.origin.x <= visible.origin.x + kNDPinTol;
+}
+
+static BOOL NDPinnedToVisibleRight(CGRect frame, CGRect visible) {
+    return (frame.origin.x + frame.size.width) >= (visible.origin.x + visible.size.width - kNDPinTol);
+}
+
+static CGRect NDCapNearFullOnly(CGRect frame, NSScreen *screen) {
+    CGFloat margin = NDWindowMarginPerSide();
+    if (!screen || margin <= 0) return frame;
+    if (NDIsNearFull(frame, screen.visibleFrame))
+        return NDMaxAllowedFrame(screen, margin);
     return frame;
 }
 
-static BOOL NDIsNSWindowSubclass(Class cls, Class windowClass) {
-    if (!cls || !windowClass || cls == windowClass) return NO;
+static CGRect NDCapPinnedEdges(CGRect frame, NSScreen *screen) {
+    CGFloat margin = NDWindowMarginPerSide();
+    if (!screen || margin <= 0) return frame;
+    CGRect visible = screen.visibleFrame;
+    if (NDIsNearFull(frame, visible))
+        return NDMaxAllowedFrame(screen, margin);
+
+    if (NDFrameHasProperMargins(frame, visible, margin))
+        return frame;
+
+    BOOL pinL = NDPinnedToVisibleLeft(frame, visible);
+    BOOL pinR = NDPinnedToVisibleRight(frame, visible);
+    BOOL pinB = NDPinnedToVisibleBottom(frame, visible);
+    BOOL pinT = NDPinnedToVisibleTop(frame, visible);
+    if (!pinL && !pinR && !pinB && !pinT)
+        return frame;
+
+    CGRect out = frame;
+    if (pinL && NDTouchesLeftEdge(frame, visible, margin)) {
+        out.origin.x = visible.origin.x + margin;
+        out.size.width = (frame.origin.x + frame.size.width) - out.origin.x;
+    }
+    if (pinR && NDTouchesRightEdge(out, visible, margin))
+        out.size.width = visible.origin.x + visible.size.width - margin - out.origin.x;
+    if (pinB && NDTouchesBottomEdge(out, visible, margin)) {
+        out.origin.y = visible.origin.y + margin;
+        out.size.height = (frame.origin.y + frame.size.height) - out.origin.y;
+    }
+    if (pinT && NDTouchesTopEdge(out, visible, margin))
+        out.size.height = visible.origin.y + visible.size.height - margin - out.origin.y;
+    if (out.size.width < 1.0 || out.size.height < 1.0)
+        return frame;
+    return out;
+}
+
+static void nd_setFrameCommon(id self, SEL _cmd, CGRect frame, BOOL display, BOOL fromServer) {
+    if (gNDInSetFrameCommon) {
+        if (orig_setFrameCommon)
+            orig_setFrameCommon(self, _cmd, frame, display, fromServer);
+        return;
+    }
+    NDEnsureSubclassHooked(self);
+    set_frame_common_fn orig = (set_frame_common_fn)NDSubclassOrigIMP(self, gSubclassSetFrameCommonOrig,
+                                                                      (IMP)orig_setFrameCommon);
+    if (!orig) return;
+    if (NDShouldHookWindow(self))
+        frame = NDCapPinnedEdges(frame, NDWindowScreen(self));
+    gNDInSetFrameCommon = YES;
+    orig(self, _cmd, frame, display, fromServer);
+    gNDInSetFrameCommon = NO;
+}
+
+static void nd_setFrameAnimate(id self, SEL _cmd, CGRect frame, BOOL display, BOOL animate) {
+    if (gNDInSetFrameAnimate) {
+        if (orig_setFrameAnimate)
+            orig_setFrameAnimate(self, _cmd, frame, display, animate);
+        return;
+    }
+    NDEnsureSubclassHooked(self);
+    set_frame_animate_fn orig = (set_frame_animate_fn)NDSubclassOrigIMP(self, gSubclassSetFrameAnimateOrig,
+                                                                        (IMP)orig_setFrameAnimate);
+    if (!orig) return;
+    if (NDShouldHookWindow(self))
+        frame = NDCapNearFullOnly(frame, NDWindowScreen(self));
+    gNDInSetFrameAnimate = YES;
+    orig(self, _cmd, frame, display, animate);
+    gNDInSetFrameAnimate = NO;
+}
+
+static void nd_setFrameDisplay(id self, SEL _cmd, CGRect frame, BOOL display) {
+    if (gNDInSetFrame) {
+        if (orig_setFrameDisplay)
+            orig_setFrameDisplay(self, _cmd, frame, display);
+        return;
+    }
+    NDEnsureSubclassHooked(self);
+    set_frame_fn orig = (set_frame_fn)NDSubclassOrigIMP(self, gSubclassSetFrameOrig, (IMP)orig_setFrameDisplay);
+    if (!orig) return;
+    if (NDShouldHookWindow(self))
+        frame = NDCapNearFullOnly(frame, NDWindowScreen(self));
+    gNDInSetFrame = YES;
+    orig(self, _cmd, frame, display);
+    gNDInSetFrame = NO;
+}
+
+static CGRect nd_constrainFrameRect(id self, SEL _cmd, CGRect frame, id screen) {
+    if (gNDInConstrain) {
+        if (orig_constrainFrame) return orig_constrainFrame(self, _cmd, frame, screen);
+        return frame;
+    }
+    constrain_fn orig = (constrain_fn)NDSubclassOrigIMP(self, gSubclassConstrainOrig, (IMP)orig_constrainFrame);
+    if (!orig) return frame;
+
+    gNDInConstrain = YES;
+    CGRect out = orig(self, _cmd, frame, screen);
+    if (NDShouldHookWindow(self)) {
+        NSScreen *scr = [(id)screen isKindOfClass:[NSScreen class]] ? (NSScreen *)screen : NDWindowScreen(self);
+        out = NDCapFrame(out, scr, NDIsNearFull(out, scr.visibleFrame));
+    }
+    gNDInConstrain = NO;
+    return out;
+}
+
+static BOOL NDIsNSWindowSubclass(Class cls) {
+    if (!cls || cls == gNSWindowClass) return NO;
     for (Class c = cls; c; c = class_getSuperclass(c)) {
-        if (c == windowClass) return YES;
+        if (c == gNSWindowClass) return YES;
     }
     return NO;
 }
 
-static BOOL NDShouldHookSubclass(Class cls, Class windowClass, Method m, IMP hookIMP) {
+static BOOL NDShouldHookSubclass(Class cls, Method m, IMP hookIMP) {
     if (!m || !hookIMP) return NO;
     if (method_getImplementation(m) == hookIMP) return NO;
-    Method base = class_getInstanceMethod(windowClass, method_getName(m));
+    Method base = class_getInstanceMethod(gNSWindowClass, method_getName(m));
     if (!base) return YES;
     return method_getImplementation(base) != method_getImplementation(m);
 }
 
-static void NDHookSubclassMethod(Class cls, SEL sel, IMP hookIMP,
-                                 NSMutableSet *hooked, NSMutableDictionary *origMap) {
+static void NDHookSubclassMethod(Class cls, SEL sel, IMP hookIMP, NSMutableDictionary *origMap) {
     if (!cls || !hookIMP) return;
-    Class windowClass = NSClassFromString(@"NSWindow");
-    if (!NDIsNSWindowSubclass(cls, windowClass)) return;
+    if (!NDIsNSWindowSubclass(cls)) return;
 
     NSString *key = [NSString stringWithFormat:@"%@:%@", NSStringFromClass(cls), NSStringFromSelector(sel)];
-    if ([hooked containsObject:key]) return;
+    if ([gHookedMethods containsObject:key]) return;
 
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m || !NDShouldHookSubclass(cls, windowClass, m, hookIMP)) return;
+    if (!m || !NDShouldHookSubclass(cls, m, hookIMP)) return;
 
     if (!origMap[NSStringFromClass(cls)])
         origMap[NSStringFromClass(cls)] = [NSValue valueWithPointer:method_getImplementation(m)];
 
     method_setImplementation(m, hookIMP);
-    [hooked addObject:key];
+    [gHookedMethods addObject:key];
 }
 
 static void NDHookWindowSubclass(Class cls) {
     if (!cls) return;
-    if (!gHookedSetFrameClasses) gHookedSetFrameClasses = [NSMutableSet set];
-    if (!gHookedSetFrameAnimClasses) gHookedSetFrameAnimClasses = [NSMutableSet set];
-    if (!gHookedConstrainClasses) gHookedConstrainClasses = [NSMutableSet set];
-    if (!gHookedZoomClasses) gHookedZoomClasses = [NSMutableSet set];
-    if (!gHookedPerformZoomClasses) gHookedPerformZoomClasses = [NSMutableSet set];
-    if (!gSubclassSetFrameOrig) gSubclassSetFrameOrig = [NSMutableDictionary new];
-    if (!gSubclassSetFrameAnimOrig) gSubclassSetFrameAnimOrig = [NSMutableDictionary new];
-    if (!gSubclassConstrainOrig) gSubclassConstrainOrig = [NSMutableDictionary new];
-    if (!gSubclassZoomOrig) gSubclassZoomOrig = [NSMutableDictionary new];
-    if (!gSubclassPerformZoomOrig) gSubclassPerformZoomOrig = [NSMutableDictionary new];
+    NDEnsureHookCollections();
 
-    NDHookSubclassMethod(cls, @selector(setFrame:display:), gSetFrameHookIMP,
-                         gHookedSetFrameClasses, gSubclassSetFrameOrig);
-    NDHookSubclassMethod(cls, sel_getUid("setFrame:display:animate:"), gSetFrameAnimHookIMP,
-                         gHookedSetFrameAnimClasses, gSubclassSetFrameAnimOrig);
+    NDHookSubclassMethod(cls, @selector(setFrame:display:), gSetFrameHookIMP, gSubclassSetFrameOrig);
+    NDHookSubclassMethod(cls, sel_getUid("setFrame:display:animate:"), gSetFrameAnimateHookIMP,
+                         gSubclassSetFrameAnimateOrig);
+    NDHookSubclassMethod(cls, sel_getUid("_zoomToFrame:willChangeScreens:toIPad:zoomState:"),
+                         gZoomToFrameHookIMP, gSubclassZoomToFrameOrig);
     NDHookSubclassMethod(cls, @selector(constrainFrameRect:toScreen:), gConstrainHookIMP,
-                         gHookedConstrainClasses, gSubclassConstrainOrig);
-    NDHookSubclassMethod(cls, @selector(zoom:), gZoomHookIMP,
-                         gHookedZoomClasses, gSubclassZoomOrig);
-    NDHookSubclassMethod(cls, @selector(performZoom:), gPerformZoomHookIMP,
-                         gHookedPerformZoomClasses, gSubclassPerformZoomOrig);
-}
-
-static void NDEnsureInstanceClassHooked(id self) {
-    Class cls = object_getClass(self);
-    Class windowClass = NSClassFromString(@"NSWindow");
-    if (!cls || !windowClass || cls == windowClass) return;
-    if (!NDIsNSWindowSubclass(cls, windowClass)) return;
-
-    Method m = class_getInstanceMethod(cls, @selector(setFrame:display:));
-    if (m && method_getImplementation(m) != gSetFrameHookIMP)
-        NDHookWindowSubclass(cls);
-}
-
-static void NDEnsureZoomHooked(id self) {
-    Class cls = object_getClass(self);
-    Method m = class_getInstanceMethod(cls, @selector(zoom:));
-    if (m && method_getImplementation(m) != gZoomHookIMP)
-        NDHookWindowSubclass(cls);
-}
-
-static void nd_setFrameDisplay(id self, SEL _cmd, CGRect frame, BOOL display) {
-    NDEnsureInstanceClassHooked(self);
-    if (gNDInSetFrame) {
-        if (orig_setFrameDisplay) orig_setFrameDisplay(self, _cmd, frame, display);
-        return;
-    }
-    set_frame_fn orig = NDOrigSetFrameForObject(self);
-    if (!orig) return;
-
-    gNDInSetFrame = YES;
-    frame = NDAdjustSetFrame(self, frame);
-    orig(self, _cmd, frame, display);
-    gNDInSetFrame = NO;
-}
-
-static void nd_setFrameDisplayAnimate(id self, SEL _cmd, CGRect frame, BOOL display, BOOL animate) {
-    NDEnsureInstanceClassHooked(self);
-    if (gNDInSetFrame) {
-        if (orig_setFrameDisplayAnimate)
-            orig_setFrameDisplayAnimate(self, _cmd, frame, display, animate);
-        return;
-    }
-    set_frame_anim_fn orig = NDOrigSetFrameAnimForObject(self);
-    if (!orig) return;
-
-    if (NDMarginLockActive(self)) {
-        NSScreen *screen = NDWindowScreen(self);
-        if (screen && NDIsNearFull(frame, screen.visibleFrame))
-            frame = NDMarginLockedFrame(self);
-    } else {
-        frame = NDApplyMarginIntent(self, frame);
-    }
-
-    orig(self, _cmd, frame, display, animate);
-}
-
-static CGRect nd_constrainFrameRect(id self, SEL _cmd, CGRect frame, id screen) {
-    NDEnsureInstanceClassHooked(self);
-    if (gNDInConstrain) {
-        if (orig_constrainFrame) return orig_constrainFrame(self, _cmd, frame, screen);
-        return frame;
-    }
-    constrain_fn orig = NDOrigConstrainForObject(self);
-    if (!orig) return frame;
-
-    gNDInConstrain = YES;
-    CGRect input = frame;
-    if (NDMarginLockActive(self)) {
-        NSScreen *scr = [(id)screen isKindOfClass:[NSScreen class]] ? (NSScreen *)screen : NDWindowScreen(self);
-        if (scr && NDIsNearFull(frame, scr.visibleFrame)) {
-            gNDInConstrain = NO;
-            return NDMarginLockedFrame(self);
-        }
-    }
-    CGRect out = orig(self, _cmd, frame, screen);
-    out = NDAdjustConstrainOutput(self, out, input, screen);
-    gNDInConstrain = NO;
-    return out;
-}
-
-static void nd_zoomToFrame(id self, SEL _cmd, CGRect frame, BOOL willChangeScreens,
-                           BOOL moveToIPad, NSInteger zoomState) {
-    if (!orig_zoomToFrame) return;
-    frame = NDApplyMarginIntent(self, frame);
-    orig_zoomToFrame(self, _cmd, frame, willChangeScreens, moveToIPad, zoomState);
-}
-
-static void nd_zoomToScreen(id self, SEL _cmd, id sender, BOOL moveToIPad) {
-    if (!orig_zoomToScreen) return;
-    NDPrepareFillLock(self);
-    orig_zoomToScreen(self, _cmd, sender, moveToIPad);
-}
-
-static void nd_zoomFill(id self, SEL _cmd, id sender) {
-    NDPrepareFillLock(self);
-    if (orig_zoomToScreen) {
-        orig_zoomToScreen(self, sel_getUid("_zoomToScreen:isMoveToiPad:"), sender, NO);
-        return;
-    }
-    if (!orig_zoomFill) return;
-    orig_zoomFill(self, _cmd, sender);
-}
-
-static void nd_zoom(id self, SEL _cmd, id sender) {
-    NDEnsureZoomHooked(self);
-    if (gNDInZoom) {
-        if (orig_zoom) orig_zoom(self, _cmd, sender);
-        return;
-    }
-    zoom_fn orig = NDOrigZoomForObject(self);
-    if (!orig) return;
-    gNDInZoom = YES;
-    NDPrepareFillLock(self);
-    orig(self, _cmd, sender);
-    gNDInZoom = NO;
-}
-
-static void nd_performZoom(id self, SEL _cmd, id sender) {
-    if (gNDInZoom) {
-        if (orig_performZoom) orig_performZoom(self, _cmd, sender);
-        return;
-    }
-    zoom_fn orig = NDOrigPerformZoomForObject(self);
-    if (!orig) return;
-    gNDInZoom = YES;
-    NDPrepareFillLock(self);
-    orig(self, _cmd, sender);
-    gNDInZoom = NO;
-}
-
-static void nd_doubleTapGesture(id self, SEL _cmd, id gesture) {
-    if (!orig_doubleTapGesture) return;
-    id win = [(id)self window];
-    if (win && [win isKindOfClass:[NSWindow class]])
-        NDPrepareFillLock(win);
-    orig_doubleTapGesture(self, _cmd, gesture);
-}
-
-static CGRect nd_standardFrame(id self, SEL _cmd) {
-    if (NDMarginLockActive(self))
-        return NDMarginLockedFrame(self);
-    return NDApplyMarginIntent(self, orig_standardFrame(self, _cmd));
-}
-
-static CGRect nd_standardFrameForScreen(id self, SEL _cmd, id screen, BOOL moveToIPad) {
-    if (NDMarginLockActive(self))
-        return NDMarginLockedFrame(self);
-    CGRect out = orig_standardFrameForScreen(self, _cmd, screen, moveToIPad);
-    if (!screen) return out;
-    return NDApplyMarginIntent(self, out);
+                         gSubclassConstrainOrig);
+    NDHookSubclassMethod(cls, sel_getUid("_standardFrame"), gStandardFrameHookIMP,
+                         gSubclassStandardFrameOrig);
+    NDHookSubclassMethod(cls, sel_getUid("_standardFrameForScreen:isMoveToiPad:"),
+                         gStandardFrameForScreenHookIMP, gSubclassStandardFrameForScreenOrig);
+    NDHookSubclassMethod(cls, sel_getUid("_setFrameCommon:display:fromServer:"),
+                         gSetFrameCommonHookIMP, gSubclassSetFrameCommonOrig);
 }
 
 static void NDHookSubclassesFromImage(const char *imagePath) {
@@ -447,143 +421,115 @@ static void NDHookSubclassesFromImage(const char *imagePath) {
     if (!names) return;
 
     for (unsigned int i = 0; i < count; i++) {
+        if (strncmp(names[i], "NSKVONotifying_", 15) == 0) continue;
+        if (!strstr(names[i], "Window")) continue;
         Class cls = objc_getClass(names[i]);
-        if (cls) NDHookWindowSubclass(cls);
+        if (cls && NDIsNSWindowSubclass(cls))
+            NDHookWindowSubclass(cls);
     }
     free(names);
 }
 
-static void NDHookKnownClasses(void) {
-    for (int i = 0; kNDKnownWindowClasses[i]; i++) {
-        Class cls = objc_getClass(kNDKnownWindowClasses[i]);
-        if (cls) NDHookWindowSubclass(cls);
-    }
-}
-
-static void (*orig_finishLaunching)(id, SEL) = NULL;
-
-static void nd_finishLaunching(id self, SEL _cmd) {
-    if (orig_finishLaunching)
-        orig_finishLaunching(self, _cmd);
-    dispatch_async(dispatch_get_main_queue(), ^{ NDHookKnownClasses(); });
-}
-
-static void NDInstallFinishLaunchingHook(void) {
-    if (orig_finishLaunching) return;
-    Class app = NSClassFromString(@"NSApplication");
-    Method m = app ? class_getInstanceMethod(app, @selector(finishLaunching)) : NULL;
-    if (!m) return;
-    orig_finishLaunching = (void (*)(id, SEL))method_getImplementation(m);
-    method_setImplementation(m, (IMP)nd_finishLaunching);
-}
-
-static void NDInstallThemeFrameHook(void) {
-    if (orig_doubleTapGesture) return;
-    Class tf = NSClassFromString(@"NSThemeFrame");
-    Method m = tf ? class_getInstanceMethod(tf, @selector(handleDoubleTapOrClickGesture:)) : NULL;
-    if (!m) return;
-    orig_doubleTapGesture = (gesture_fn)method_getImplementation(m);
-    method_setImplementation(m, (IMP)nd_doubleTapGesture);
-}
-
 static void NDInstallWindowHooks(void) {
-    if (NDWindowMarginPerSide() <= 0 || NDIsDockProcess()) return;
+    if (!gNDWindowMarginActive) return;
+    if (!gNSWindowClass) return;
 
-    Class cls = objc_getClass("NSWindow");
-    if (!cls) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gConstrainHookIMP = (IMP)nd_constrainFrameRect;
+        gSetFrameHookIMP = (IMP)nd_setFrameDisplay;
+        gStandardFrameHookIMP = (IMP)nd_standardFrame;
+        gStandardFrameForScreenHookIMP = (IMP)nd_standardFrameForScreen;
+        gZoomToFrameHookIMP = (IMP)nd_zoomToFrame;
+        gSetFrameAnimateHookIMP = (IMP)nd_setFrameAnimate;
+        gSetFrameCommonHookIMP = (IMP)nd_setFrameCommon;
+        NDEnsureHookCollections();
 
-    if (!gSetFrameHookIMP) gSetFrameHookIMP = (IMP)nd_setFrameDisplay;
-    if (!gSetFrameAnimHookIMP) gSetFrameAnimHookIMP = (IMP)nd_setFrameDisplayAnimate;
-    if (!gConstrainHookIMP) gConstrainHookIMP = (IMP)nd_constrainFrameRect;
-    if (!gZoomHookIMP) gZoomHookIMP = (IMP)nd_zoom;
-    if (!gPerformZoomHookIMP) gPerformZoomHookIMP = (IMP)nd_performZoom;
+        Method m = class_getInstanceMethod(gNSWindowClass, @selector(setFrame:display:));
+        if (m) {
+            orig_setFrameDisplay = (set_frame_fn)method_getImplementation(m);
+            method_setImplementation(m, gSetFrameHookIMP);
+        }
+        m = class_getInstanceMethod(gNSWindowClass, sel_getUid("setFrame:display:animate:"));
+        if (m) {
+            orig_setFrameAnimate = (set_frame_animate_fn)method_getImplementation(m);
+            method_setImplementation(m, gSetFrameAnimateHookIMP);
+        }
+        m = class_getInstanceMethod(gNSWindowClass, sel_getUid("_zoomToFrame:willChangeScreens:toIPad:zoomState:"));
+        if (m) {
+            orig_zoomToFrame = (zoom_to_frame_fn)method_getImplementation(m);
+            method_setImplementation(m, gZoomToFrameHookIMP);
+        }
+        m = class_getInstanceMethod(gNSWindowClass, sel_getUid("_standardFrame"));
+        if (m) {
+            orig_standardFrame = (std_frame_fn)method_getImplementation(m);
+            method_setImplementation(m, gStandardFrameHookIMP);
+        }
+        m = class_getInstanceMethod(gNSWindowClass, sel_getUid("_standardFrameForScreen:isMoveToiPad:"));
+        if (m) {
+            orig_standardFrameForScreen = (std_screen_fn)method_getImplementation(m);
+            method_setImplementation(m, gStandardFrameForScreenHookIMP);
+        }
+        m = class_getInstanceMethod(gNSWindowClass, @selector(constrainFrameRect:toScreen:));
+        if (m) {
+            orig_constrainFrame = (constrain_fn)method_getImplementation(m);
+            method_setImplementation(m, gConstrainHookIMP);
+        }
+        m = class_getInstanceMethod(gNSWindowClass, sel_getUid("_setFrameCommon:display:fromServer:"));
+        if (m) {
+            orig_setFrameCommon = (set_frame_common_fn)method_getImplementation(m);
+            method_setImplementation(m, gSetFrameCommonHookIMP);
+        }
+        for (int i = 0; kNDKnownWindowClasses[i]; i++) {
+            Class known = objc_getClass(kNDKnownWindowClasses[i]);
+            if (known) NDHookWindowSubclass(known);
+        }
+    });
+}
 
-    Method m = class_getInstanceMethod(cls, @selector(setFrame:display:));
-    if (m && !orig_setFrameDisplay) {
-        orig_setFrameDisplay = (set_frame_fn)method_getImplementation(m);
-        method_setImplementation(m, gSetFrameHookIMP);
+static const char *NDImagePathForHeader(const struct mach_header *mh) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        if (_dyld_get_image_header(i) == mh)
+            return _dyld_get_image_name(i);
     }
-
-    m = class_getInstanceMethod(cls, sel_getUid("setFrame:display:animate:"));
-    if (m && !orig_setFrameDisplayAnimate) {
-        orig_setFrameDisplayAnimate = (set_frame_anim_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_setFrameDisplayAnimate);
-    }
-
-    m = class_getInstanceMethod(cls, sel_getUid("_zoomToFrame:willChangeScreens:toIPad:zoomState:"));
-    if (m && !orig_zoomToFrame) {
-        orig_zoomToFrame = (zoom_to_frame_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_zoomToFrame);
-    }
-
-    m = class_getInstanceMethod(cls, sel_getUid("_zoomToScreen:isMoveToiPad:"));
-    if (m && !orig_zoomToScreen) {
-        orig_zoomToScreen = (zoom_to_screen_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_zoomToScreen);
-    }
-
-    m = class_getInstanceMethod(cls, sel_getUid("_zoomFill:"));
-    if (m && !orig_zoomFill) {
-        orig_zoomFill = (zoom_fill_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_zoomFill);
-    }
-
-    m = class_getInstanceMethod(cls, @selector(zoom:));
-    if (m && !orig_zoom) {
-        orig_zoom = (zoom_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_zoom);
-    }
-
-    m = class_getInstanceMethod(cls, @selector(performZoom:));
-    if (m && !orig_performZoom) {
-        orig_performZoom = (zoom_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_performZoom);
-    }
-
-    m = class_getInstanceMethod(cls, sel_getUid("_standardFrame"));
-    if (m && !orig_standardFrame) {
-        orig_standardFrame = (std_frame_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_standardFrame);
-    }
-
-    m = class_getInstanceMethod(cls, sel_getUid("_standardFrameForScreen:isMoveToiPad:"));
-    if (m && !orig_standardFrameForScreen) {
-        orig_standardFrameForScreen = (std_screen_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_standardFrameForScreen);
-    }
-
-    m = class_getInstanceMethod(cls, @selector(constrainFrameRect:toScreen:));
-    if (m && !orig_constrainFrame) {
-        orig_constrainFrame = (constrain_fn)method_getImplementation(m);
-        method_setImplementation(m, (IMP)nd_constrainFrameRect);
-    }
-
-    NDInstallFinishLaunchingHook();
-    NDInstallThemeFrameHook();
-    NDHookKnownClasses();
+    return NULL;
 }
 
 static void nd_window_on_image(const struct mach_header *mh, intptr_t slide) {
     (void)slide;
+    if (!gNDWindowMarginActive) return;
+
+    const char *imagePath = NDImagePathForHeader(mh);
+    if (!imagePath) return;
+
+    BOOL isApp = strstr(imagePath, ".app/") != NULL;
+    BOOL isSwiftUI = !gNDSwiftUIHooked && strstr(imagePath, "SwiftUI.framework") != NULL;
+    if (!isApp && !isSwiftUI) return;
+
     if (!objc_getClass("NSWindow")) return;
 
-    NDInstallWindowHooks();
-
-    const char *imagePath = NULL;
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        if (_dyld_get_image_header(i) == mh) {
-            imagePath = _dyld_get_image_name(i);
-            break;
+    if (isApp)
+        NDHookSubclassesFromImage(imagePath);
+    if (isSwiftUI) {
+        Class swiftWin = objc_getClass("SwiftUI.AppKitWindow");
+        if (swiftWin) {
+            NDHookWindowSubclass(swiftWin);
+            gNDSwiftUIHooked = YES;
         }
     }
-    if (imagePath)
-        NDHookSubclassesFromImage(imagePath);
 }
 
 void NDWindowMarginInit(void) {
-    if (NDWindowMarginPerSide() <= 0 || NDIsDockProcess()) return;
+    if (NDIsDockProcess()) return;
+    if (!NDMarginEnabled()) return;
+
+    gNDWindowMarginActive = YES;
+    gNSWindowClass = objc_getClass("NSWindow");
+    if (!gNSWindowClass) return;
+
     if (!gCopyClassNamesForImage)
         gCopyClassNamesForImage = (copy_class_names_fn)dlsym(RTLD_DEFAULT, "objc_copyClassNamesForImage");
-    _dyld_register_func_for_add_image(nd_window_on_image);
+
     NDInstallWindowHooks();
+    _dyld_register_func_for_add_image(nd_window_on_image);
 }

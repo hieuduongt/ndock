@@ -21,17 +21,46 @@ ndock_ensure_stub() {
 
 ndock_uninstall() {
   launchctl bootout "$GUI_DOMAIN/com.ndock.inject" 2>/dev/null
+  launchctl bootout "$GUI_DOMAIN/com.ndock.autoinstall" 2>/dev/null
   rm -f "$HOME/Library/LaunchAgents/com.ndock.inject.plist"
+  rm -f "$HOME/Library/LaunchAgents/com.ndock.autoinstall.plist"
+
+  local stub="$NDOCK_ROOT/bootstrap/NDock.stub.dylib"
+  if [[ -f "$stub" ]] && codesign -f -s - "$stub" >/dev/null 2>&1; then
+    command mkdir -p "$NDOCK_HOME"
+    command cp -f "$stub" "$NDOCK_HOME/NDock.dylib"
+    command codesign -f -s - "$NDOCK_HOME/NDock.dylib" 2>/dev/null
+  elif [[ -f "$stub" ]]; then
+    command rm -f "$stub"
+    "$NDOCK_ROOT/bootstrap/build-stub.sh" >/dev/null
+    command mkdir -p "$NDOCK_HOME"
+    command cp -f "$stub" "$NDOCK_HOME/NDock.dylib"
+    command codesign -f -s - "$NDOCK_HOME/NDock.dylib" 2>/dev/null
+  fi
+
   launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null
-  rm -rf "$NDOCK_HOME"
-  killall Dock 2>/dev/null
+  command killall Dock 2>/dev/null
+  sleep 2
+  command rm -rf "$NDOCK_HOME"
   print "Đã gỡ N-Dock."
   print "DYLD_INSERT_LIBRARIES=$(launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null || print '(unset)')"
+}
+
+ndock_restore_stub() {
+  ndock_ensure_stub || return 1
+  command mkdir -p "$NDOCK_HOME"
+  command cp -f "$NDOCK_ROOT/bootstrap/NDock.stub.dylib" "$NDOCK_HOME/NDock.dylib"
+  command codesign -f -s - "$NDOCK_HOME/NDock.dylib" 2>/dev/null
+  print "Đã đặt stub tại $NDOCK_HOME/NDock.dylib"
+  print "Tiếp theo: source ./recover.zsh uninstall"
 }
 
 case "${1:-help}" in
   uninstall)
     ndock_uninstall
+    ;;
+  restore-stub)
+    ndock_restore_stub
     ;;
   stub)
     ndock_ensure_stub
@@ -55,6 +84,7 @@ case "${1:-help}" in
     print "N-Dock recover (chạy bằng source, KHÔNG ./recover.zsh)"
     print ""
     print "  source ./recover.zsh uninstall"
+    print "  source ./recover.zsh restore-stub   # khi Terminal crash vì thiếu dylib"
     print "  source ./recover.zsh stub"
     print "  source ./recover.zsh build"
     print "  source ./recover.zsh app"

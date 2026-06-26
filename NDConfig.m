@@ -1,18 +1,14 @@
 #import "NDConfig.h"
 #import <Foundation/Foundation.h>
+#import <string.h>
+#import <unistd.h>
 
 static NSString *NDConfigPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/N-Dock/settings.plist"];
 }
 
-static NSDictionary *NDLoadConfig(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:NDConfigPath()];
-    if (d) return d;
-    return @{
-        @"windowMarginPerSide": @5,
-        @"dockMarginPerSide": @5,
-    };
-}
+static CGFloat gNDWindowMargin = NDDefaultMarginPerSide;
+static CGFloat gNDDockMargin = NDDefaultMarginPerSide;
 
 static CGFloat NDClampMargin(NSNumber *n, CGFloat fallback) {
     if (!n) return fallback;
@@ -22,12 +18,29 @@ static CGFloat NDClampMargin(NSNumber *n, CGFloat fallback) {
     return v;
 }
 
+static void NDEnsureMarginsCached(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:NDConfigPath()];
+        if (!d) return;
+        gNDWindowMargin = NDClampMargin(d[@"windowMarginPerSide"], NDDefaultMarginPerSide);
+        gNDDockMargin = NDClampMargin(d[@"dockMarginPerSide"], NDDefaultMarginPerSide);
+    });
+}
+
+BOOL NDIsDockProcess(void) {
+    const char *p = getprogname();
+    return p && strcmp(p, "Dock") == 0;
+}
+
 CGFloat NDWindowMarginPerSide(void) {
-    return NDClampMargin(NDLoadConfig()[@"windowMarginPerSide"], 5.0);
+    NDEnsureMarginsCached();
+    return gNDWindowMargin;
 }
 
 CGFloat NDDockMarginPerSide(void) {
-    return NDClampMargin(NDLoadConfig()[@"dockMarginPerSide"], 5.0);
+    NDEnsureMarginsCached();
+    return gNDDockMargin;
 }
 
 CGFloat NDDockMarginTotal(void) {

@@ -15,6 +15,10 @@ if [ "$(wc -c < NDock.dylib | tr -d ' ')" -lt 100000 ]; then
   exit 1
 fi
 [ -d "$ICONSET" ] || { echo "Thiếu App/AppIcon.iconset" >&2; exit 1; }
+if ! codesign -f -s - bootstrap/NDock.stub.dylib >/dev/null 2>&1; then
+  rm -f bootstrap/NDock.stub.dylib
+  "$DIR/bootstrap/build-stub.sh"
+fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$RES"
@@ -30,8 +34,10 @@ swiftc "$DIR/App/NDockCore.swift" "$DIR/App/main.swift" \
 cp App/Info.plist "$APP/Contents/Info.plist"
 iconutil -c icns "$ICONSET" -o "$RES/AppIcon.icns"
 cp NDock.dylib "$RES/NDock.dylib"
+cp bootstrap/NDock.stub.dylib "$RES/NDock.stub.dylib"
 
 codesign -f -s - "$RES/NDock.dylib"
+codesign -f -s - "$RES/NDock.stub.dylib"
 codesign -f -s - "$BIN"
 codesign -f -s - "$APP"
 touch "$APP"

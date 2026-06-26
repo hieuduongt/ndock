@@ -77,11 +77,14 @@ struct NDockSettings {
 
 enum NDockCore {
     static let dockBinary = "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
-    static let bootScriptBody = """
+  static let bootScriptBody = """
     #!/usr/bin/env -u DYLD_INSERT_LIBRARIES bash
     DIR="$(cd "$(dirname "$0")" && pwd)"
     DYLIB="$DIR/NDock.dylib"
-    [ -f "$DYLIB" ] || exit 0
+    if [ ! -f "$DYLIB" ]; then
+      launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
+      exit 0
+    fi
     launchctl setenv DYLD_INSERT_LIBRARIES "$DYLIB"
     sleep 2
     /usr/bin/killall Dock 2>/dev/null || true
@@ -98,6 +101,21 @@ enum NDockCore {
 
     static var bundledDylib: URL? {
         Bundle.main.url(forResource: "NDock", withExtension: "dylib")
+    }
+
+    static var bundledStubDylib: URL? {
+        Bundle.main.url(forResource: "NDock.stub", withExtension: "dylib")
+    }
+
+    static func deploySafeDylibPlaceholder() throws {
+        let source = bundledStubDylib ?? bundledDylib
+        guard let source else { return }
+        try FileManager.default.createDirectory(at: ndockHome, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: installedDylib.path) {
+            try? FileManager.default.removeItem(at: installedDylib)
+        }
+        try FileManager.default.copyItem(at: source, to: installedDylib)
+        codesign(installedDylib)
     }
 
     static var guiDomain: String { "gui/\(getuid())" }
@@ -181,6 +199,9 @@ enum NDockCore {
     }
 
     static func installLaunchAgent() throws {
+        guard FileManager.default.fileExists(atPath: installedDylib.path) else {
+            throw NDockError.missingInstalledDylib
+        }
         let plistDir = launchAgentPlist.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: plistDir, withIntermediateDirectories: true)
         let plist = """
@@ -330,9 +351,23 @@ enum NDockCore {
         try? removeAutoInstallLaunchAgent()
         try? runSilent("/bin/launchctl", ["bootout", guiDomain + "/com.ndock.inject"])
         try? FileManager.default.removeItem(at: launchAgentPlist)
+
+        try? deploySafeDylibPlaceholder()
+
         try? runSilent("/bin/launchctl", ["unsetenv", "DYLD_INSERT_LIBRARIES"])
-        try? FileManager.default.removeItem(at: ndockHome)
         try? runSilent("/usr/bin/killall", ["Dock"])
+        Thread.sleep(forTimeInterval: 2.0)
+        try? FileManager.default.removeItem(at: ndockHome)
+
+        let env = (try? run("/bin/launchctl", ["getenv", "DYLD_INSERT_LIBRARIES"])) ?? ""
+        if !env.isEmpty {
+            return """
+            Đã gỡ N-Dock.
+            Cảnh báo: DYLD_INSERT_LIBRARIES vẫn còn.
+            Mở Terminal mới và chạy: launchctl unsetenv DYLD_INSERT_LIBRARIES
+            Hoặc: source ./recover.zsh uninstall
+            """
+        }
         return "Đã gỡ N-Dock."
     }
 

@@ -1,13 +1,21 @@
-#!/usr/bin/env -u DYLD_INSERT_LIBRARIES bash
+#!/bin/bash
+# Re-exec without inherited DYLD when possible (avoids inject into ndock itself).
+if [[ -z "${NDOCK_CLEAN:-}" && -n "${DYLD_INSERT_LIBRARIES:-}" ]]; then
+  export NDOCK_CLEAN=1
+  exec /usr/bin/env -i \
+    NDOCK_CLEAN=1 \
+    HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    SHELL="/bin/bash" TMPDIR="${TMPDIR:-/tmp}" \
+    /bin/bash "$0" "$@"
+fi
 set -e
 
 # Nếu bị dyld crash: source ./recover.zsh uninstall
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -f "$SCRIPT_DIR/NDock.dylib" ]; then
-  if [ -f "$SCRIPT_DIR/bootstrap/NDock.stub.dylib" ]; then
-    cp "$SCRIPT_DIR/bootstrap/NDock.stub.dylib" "$SCRIPT_DIR/NDock.dylib"
-  fi
+  nd_copy_stub "$SCRIPT_DIR/NDock.dylib" 2>/dev/null || true
 fi
 
 NDOCK_HOME="${NDOCK_HOME:-$HOME/Library/Application Support/N-Dock}"
@@ -16,6 +24,25 @@ BOOT_SCRIPT="$NDOCK_HOME/boot.sh"
 PLIST="$HOME/Library/LaunchAgents/com.ndock.inject.plist"
 DOCK_BIN="/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
 GUI_DOMAIN="gui/$(id -u)"
+
+nd_stub_valid() {
+  [ -f "$1" ] && codesign -f -s - "$1" >/dev/null 2>&1
+}
+
+nd_copy_stub() {
+  local dest="$1"
+  local stub="$SCRIPT_DIR/bootstrap/NDock.stub.dylib"
+  if nd_stub_valid "$stub"; then
+    mkdir -p "$(dirname "$dest")"
+    cp -f "$stub" "$dest"
+    codesign -f -s - "$dest" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$stub"
+  "$SCRIPT_DIR/bootstrap/build-stub.sh" >/dev/null
+  cp -f "$stub" "$dest"
+  codesign -f -s - "$dest" 2>/dev/null || true
+}
 
 nd_stage_dylib() {
   mkdir -p "$NDOCK_HOME"
@@ -33,7 +60,10 @@ nd_write_boot_script() {
 #!/usr/bin/env -u DYLD_INSERT_LIBRARIES bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
 DYLIB="$DIR/NDock.dylib"
-[ -f "$DYLIB" ] || exit 0
+if [ ! -f "$DYLIB" ]; then
+  launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
+  exit 0
+fi
 launchctl setenv DYLD_INSERT_LIBRARIES "$DYLIB"
 sleep 2
 /usr/bin/killall Dock 2>/dev/null || true
@@ -63,6 +93,41 @@ nd_require_installed() {
   [ -f "$DYLIB" ] || { echo "Chưa cài — chạy './ndock install' trước." >&2; exit 1; }
 }
 
+nd_uninstall() {
+  launchctl bootout "$GUI_DOMAIN/com.ndock.inject" 2>/dev/null || true
+  launchctl bootout "$GUI_DOMAIN/com.ndock.autoinstall" 2>/dev/null || true
+  rm -f "$PLIST" "$HOME/Library/LaunchAgents/com.ndock.autoinstall.plist"
+
+  # Giữ file dylib hợp lệ trước khi unset — tránh mọi process DYLD crash khi gỡ
+  if ! nd_copy_stub "$DYLIB" 2>/dev/null; then
+    if [ -f "$SCRIPT_DIR/NDock.dylib" ]; then
+      mkdir -p "$NDOCK_HOME"
+      cp -f "$SCRIPT_DIR/NDock.dylib" "$DYLIB"
+      codesign -f -s - "$DYLIB" 2>/dev/null || true
+    fi
+  fi
+
+  launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
+  killall Dock 2>/dev/null || true
+  sleep 2
+
+  local left
+  left=$(launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null || true)
+
+  if [ -n "$left" ]; then
+    echo "Đã gỡ N-Dock (LaunchAgent + Dock)."
+    echo "Cảnh báo: DYLD_INSERT_LIBRARIES vẫn trỏ tới dylib."
+    echo "Giữ stub tại $DYLIB để tránh crash — logout/login sẽ dọn sạch."
+    echo "Hoặc chạy: launchctl unsetenv DYLD_INSERT_LIBRARIES"
+    return 0
+  fi
+
+  rm -rf "$NDOCK_HOME"
+
+  echo "Đã gỡ N-Dock."
+  echo "DYLD_INSERT_LIBRARIES đã unset."
+}
+
 nd_check_prereqs() {
   echo "=== Kiểm tra ==="
   csrutil status 2>&1 | head -1
@@ -74,6 +139,8 @@ nd_check_prereqs() {
 }
 
 nd_install_launch_agent() {
+  [ -f "$DYLIB" ] || { echo "Không tìm thấy $DYLIB — build/install dylib trước." >&2; exit 1; }
+
   mkdir -p "$HOME/Library/LaunchAgents"
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -172,15 +239,31 @@ case "${1:-}" in
     echo "Gỡ: ./ndock uninstall"
     ;;
 
+  repair)
+    nd_check_prereqs
+    if [ -f "$DYLIB" ]; then
+      echo "Dylib OK tại $DYLIB"
+    else
+      nd_copy_stub "$DYLIB" || {
+        echo "Thiếu dylib và stub — chạy make build && ./ndock install" >&2
+        exit 1
+      }
+      echo "Đã đặt stub dylib tại $DYLIB"
+    fi
+    left=$(launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null || true)
+    if [ -n "$left" ] && [ "$left" != "$DYLIB" ]; then
+      launchctl setenv DYLD_INSERT_LIBRARIES "$DYLIB"
+      echo "Đã sửa DYLD_INSERT_LIBRARIES -> $DYLIB"
+    elif [ -z "$left" ] && [ -f "$PLIST" ]; then
+      launchctl setenv DYLD_INSERT_LIBRARIES "$DYLIB"
+      echo "Đã set DYLD_INSERT_LIBRARIES=$DYLIB"
+    else
+      echo "DYLD_INSERT_LIBRARIES=${left:-(unset)}"
+    fi
+    ;;
+
   uninstall)
-    launchctl bootout "$GUI_DOMAIN/com.ndock.inject" 2>/dev/null || true
-    launchctl bootout "$GUI_DOMAIN/com.ndock.autoinstall" 2>/dev/null || true
-    rm -f "$PLIST" "$HOME/Library/LaunchAgents/com.ndock.autoinstall.plist"
-    launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
-    rm -rf "$NDOCK_HOME"
-    killall Dock 2>/dev/null || true
-    echo "Đã gỡ N-Dock."
-    echo "DYLD_INSERT_LIBRARIES đã unset."
+    nd_uninstall
     ;;
 
   open)
@@ -205,6 +288,7 @@ case "${1:-}" in
     echo "N-Dock"
     echo "  $0 install     — cài vào ~/Library/Application Support/N-Dock"
     echo "  $0 uninstall   — gỡ hoàn toàn"
+    echo "  $0 repair      — sửa khi thiếu dylib / DYLD lệch"
     echo "  $0 open -a App — mở app kèm dylib"
     echo "  $0 status      — kiểm tra trạng thái"
     echo "  $0 build|app|package — build (dev)"
