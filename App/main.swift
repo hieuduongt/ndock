@@ -7,13 +7,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowMarginStepper: NSStepper!
     private var dockMarginField: NSTextField!
     private var dockMarginStepper: NSStepper!
+    private var autoInstallButton: NSButton!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-           let icon = NSImage(contentsOf: url) {
-            NSApp.applicationIconImage = icon
-        }
         buildWindow()
         loadSettingsIntoUI()
         refreshStatus()
@@ -22,11 +19,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func buildWindow() {
         let w: CGFloat = 400
-        let h: CGFloat = 340
+        let h: CGFloat = 380
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
-                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                          styleMask: [.titled, .closable, .miniaturizable],
+                          backing: .buffered,
+                          defer: false)
         window.title = "N-Dock"
         window.center()
+        window.isReleasedWhenClosed = false
 
         let content = NSView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         window.contentView = content
@@ -85,6 +85,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sep.boxType = .separator
         content.addSubview(sep)
 
+        y -= 36
+        autoInstallButton = NSButton(checkboxWithTitle: "Tự Install khi đăng nhập", target: self, action: #selector(autoInstallTapped))
+        autoInstallButton.frame = NSRect(x: 20, y: y, width: 360, height: 22)
+        autoInstallButton.toolTip = "Mỗi lần login chạy NDock install ngầm — không mở cửa sổ app."
+        content.addSubview(autoInstallButton)
+
         y -= 40
         let installBtn = NSButton(title: "Install", target: self, action: #selector(installTapped))
         installBtn.bezelStyle = .rounded
@@ -117,12 +123,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMarginField.stringValue = "\(Int(s.windowMarginPerSide))"
         dockMarginStepper.doubleValue = s.dockMarginPerSide
         dockMarginField.stringValue = "\(Int(s.dockMarginPerSide))"
+        autoInstallButton.state = NDockCore.isAutoInstallEnabled() ? .on : .off
     }
 
     private func currentSettings() -> NDockSettings {
-        NDockSettings(
+        let s = NDockSettings.load()
+        return NDockSettings(
             windowMarginPerSide: windowMarginStepper.doubleValue,
-            dockMarginPerSide: dockMarginStepper.doubleValue
+            dockMarginPerSide: dockMarginStepper.doubleValue,
+            autoInstallAtLogin: s.autoInstallAtLogin,
+            autoInstallAppPath: s.autoInstallAppPath
         )
     }
 
@@ -158,6 +168,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             loadSettingsIntoUI()
         } catch {
             setStatus("Install thất bại:\n\(error.localizedDescription)")
+        }
+    }
+
+    @objc private func autoInstallTapped() {
+        let enable = autoInstallButton.state == .on
+        do {
+            setStatus(try NDockCore.setAutoInstallAtLogin(enable, settings: currentSettings()))
+            loadSettingsIntoUI()
+        } catch {
+            autoInstallButton.state = NDockCore.isAutoInstallEnabled() ? .on : .off
+            setStatus("Tự Install thất bại:\n\(error.localizedDescription)")
         }
     }
 
@@ -197,6 +218,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             setStatus("Mở app thất bại:\n\(error.localizedDescription)")
         }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        return true
     }
 }
 

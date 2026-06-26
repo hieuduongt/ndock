@@ -27,10 +27,19 @@ enum NDockError: LocalizedError {
 struct NDockSettings {
     var windowMarginPerSide: Double
     var dockMarginPerSide: Double
+    var autoInstallAtLogin: Bool
+    var autoInstallAppPath: String
 
     static let windowMarginKey = "windowMarginPerSide"
     static let dockMarginKey = "dockMarginPerSide"
-    static let defaults = NDockSettings(windowMarginPerSide: 5, dockMarginPerSide: 5)
+    static let autoInstallKey = "autoInstallAtLogin"
+    static let autoInstallAppKey = "autoInstallAppPath"
+    static let defaults = NDockSettings(
+        windowMarginPerSide: 5,
+        dockMarginPerSide: 5,
+        autoInstallAtLogin: false,
+        autoInstallAppPath: ""
+    )
 
     static var settingsURL: URL {
         NDockCore.ndockHome.appendingPathComponent("settings.plist")
@@ -42,7 +51,9 @@ struct NDockSettings {
         }
         return NDockSettings(
             windowMarginPerSide: clamp(dict[windowMarginKey]),
-            dockMarginPerSide: clamp(dict[dockMarginKey])
+            dockMarginPerSide: clamp(dict[dockMarginKey]),
+            autoInstallAtLogin: (dict[autoInstallKey] as? NSNumber)?.boolValue ?? false,
+            autoInstallAppPath: dict[autoInstallAppKey] as? String ?? ""
         )
     }
 
@@ -53,9 +64,11 @@ struct NDockSettings {
 
     func save() throws {
         try FileManager.default.createDirectory(at: NDockCore.ndockHome, withIntermediateDirectories: true)
-        let dict: [String: Double] = [
+        let dict: [String: Any] = [
             Self.windowMarginKey: windowMarginPerSide,
             Self.dockMarginKey: dockMarginPerSide,
+            Self.autoInstallKey: autoInstallAtLogin,
+            Self.autoInstallAppKey: autoInstallAppPath,
         ]
         let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
         try data.write(to: Self.settingsURL, options: .atomic)
@@ -79,6 +92,9 @@ enum NDockCore {
     static var installedDylib: URL { ndockHome.appendingPathComponent("NDock.dylib") }
     static var bootScript: URL { ndockHome.appendingPathComponent("boot.sh") }
     static var launchAgentPlist: URL { home.appendingPathComponent("Library/LaunchAgents/com.ndock.inject.plist", isDirectory: false) }
+    static var autoInstallLaunchAgentPlist: URL {
+        home.appendingPathComponent("Library/LaunchAgents/com.ndock.autoinstall.plist", isDirectory: false)
+    }
 
     static var bundledDylib: URL? {
         Bundle.main.url(forResource: "NDock", withExtension: "dylib")
@@ -227,6 +243,74 @@ enum NDockCore {
         """
     }
 
+    static var appExecutable: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/NDock")
+    }
+
+    static func isAutoInstallEnabled() -> Bool {
+        FileManager.default.fileExists(atPath: autoInstallLaunchAgentPlist.path)
+    }
+
+    static func writeAutoInstallLaunchAgent(appPath: String) throws {
+        let binary = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/MacOS/NDock").path
+        guard FileManager.default.isExecutableFile(atPath: binary) else {
+            throw NDockError.commandFailed("Không tìm thấy binary app tại \(binary)", 1)
+        }
+        let plistDir = autoInstallLaunchAgentPlist.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: plistDir, withIntermediateDirectories: true)
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>Label</key>
+          <string>com.ndock.autoinstall</string>
+          <key>ProgramArguments</key>
+          <array>
+            <string>\(binary)</string>
+            <string>install</string>
+          </array>
+          <key>RunAtLoad</key>
+          <true/>
+          <key>LimitLoadToSessionType</key>
+          <string>Aqua</string>
+        </dict>
+        </plist>
+        """
+        try plist.write(to: autoInstallLaunchAgentPlist, atomically: true, encoding: .utf8)
+        try? runSilent("/bin/launchctl", ["bootout", guiDomain + "/com.ndock.autoinstall"])
+        try runSilent("/bin/launchctl", ["bootstrap", guiDomain, autoInstallLaunchAgentPlist.path])
+        try? runSilent("/bin/launchctl", ["enable", guiDomain + "/com.ndock.autoinstall"])
+    }
+
+    static func removeAutoInstallLaunchAgent() throws {
+        try? runSilent("/bin/launchctl", ["bootout", guiDomain + "/com.ndock.autoinstall"])
+        try? FileManager.default.removeItem(at: autoInstallLaunchAgentPlist)
+    }
+
+    static func setAutoInstallAtLogin(_ enabled: Bool, settings: NDockSettings) throws -> String {
+        var s = settings
+        if enabled {
+            let appPath = Bundle.main.bundleURL.path
+            try writeAutoInstallLaunchAgent(appPath: appPath)
+            s.autoInstallAtLogin = true
+            s.autoInstallAppPath = appPath
+            try s.save()
+            let msg = try install()
+            return """
+            Đã bật tự Install khi đăng nhập.
+            Mỗi lần login sẽ chạy: NDock install (không mở UI).
+
+            \(msg)
+            """
+        }
+        try removeAutoInstallLaunchAgent()
+        s.autoInstallAtLogin = false
+        s.autoInstallAppPath = ""
+        try s.save()
+        return "Đã tắt tự Install khi đăng nhập."
+    }
+
     static func saveSettings(_ settings: NDockSettings, restartDockAfterSave: Bool) throws -> String {
         try settings.save()
         var msg = """
@@ -243,6 +327,7 @@ enum NDockCore {
     }
 
     static func uninstall() throws -> String {
+        try? removeAutoInstallLaunchAgent()
         try? runSilent("/bin/launchctl", ["bootout", guiDomain + "/com.ndock.inject"])
         try? FileManager.default.removeItem(at: launchAgentPlist)
         try? runSilent("/bin/launchctl", ["unsetenv", "DYLD_INSERT_LIBRARIES"])
@@ -254,12 +339,14 @@ enum NDockCore {
     static func statusReport() -> String {
         let dylibOK = FileManager.default.fileExists(atPath: installedDylib.path) ? "OK" : "missing"
         let agentOK = FileManager.default.fileExists(atPath: launchAgentPlist.path) ? "OK" : "missing"
+        let autoOK = isAutoInstallEnabled() ? "ON" : "OFF"
         let env = (try? run("/bin/launchctl", ["getenv", "DYLD_INSERT_LIBRARIES"])) ?? "(unset)"
         let s = NDockSettings.load()
         return """
         NDOCK_HOME=\(ndockHome.path)
         DYLIB=\(installedDylib.path) (\(dylibOK))
         LaunchAgent=\(agentOK)
+        AutoInstallLogin=\(autoOK)
         DYLD_INSERT_LIBRARIES=\(env.isEmpty ? "(unset)" : env)
         App margin=\(Int(s.windowMarginPerSide)) pt/cạnh
         Dock margin=\(Int(s.dockMarginPerSide)) pt/cạnh

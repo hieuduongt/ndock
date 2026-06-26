@@ -174,7 +174,8 @@ case "${1:-}" in
 
   uninstall)
     launchctl bootout "$GUI_DOMAIN/com.ndock.inject" 2>/dev/null || true
-    rm -f "$PLIST"
+    launchctl bootout "$GUI_DOMAIN/com.ndock.autoinstall" 2>/dev/null || true
+    rm -f "$PLIST" "$HOME/Library/LaunchAgents/com.ndock.autoinstall.plist"
     launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
     rm -rf "$NDOCK_HOME"
     killall Dock 2>/dev/null || true
