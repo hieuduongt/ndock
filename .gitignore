@@ -1,0 +1,8 @@
+NDock.dylib
+dist/
+.DS_Store
+*.bak
+App/AppIcon.icns
+
+# Giữ stub trong repo để tránh dyld crash khi dev
+!bootstrap/NDock.stub.dylib

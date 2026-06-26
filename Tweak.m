@@ -1,10 +1,12 @@
 #import <Cocoa/Cocoa.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #import <mach-o/dyld.h>
+#import "NDConfig.h"
 #import <math.h>
 #import <string.h>
 #import <unistd.h>
+
+void NDWindowMarginInit(void);
 
 // 0 = auto theo màn hình. >0 = ghi đè thủ công (pt).
 static const CGFloat kNDCustomSpan = 0;
@@ -19,18 +21,14 @@ static NSScreen *NDMainScreen(void) {
     return [NSScreen mainScreen];
 }
 
-static CGFloat NDMenuBarHeight(NSScreen *screen) {
-    if (!screen) return 0;
-    return screen.frame.size.height - screen.visibleFrame.size.height - screen.visibleFrame.origin.y;
-}
-
 static CGFloat NDAutoHorizontalSpan(NSScreen *screen) {
-    return screen ? screen.frame.size.width - 10 : 0;
+    if (!screen) return 0;
+    return screen.frame.size.width - NDDockMarginTotal();
 }
 
 static CGFloat NDAutoVerticalSpan(NSScreen *screen) {
     if (!screen) return 0;
-    return screen.visibleFrame.size.height - 10;
+    return screen.visibleFrame.size.height - NDDockMarginTotal();
 }
 
 // Dock dọc: floorFrame hẹp x cao (vd. 57x767). Dock ngang: rộng x thấp (vd. 766x57).
@@ -95,6 +93,7 @@ static void nd_on_image_added(const struct mach_header *mh, intptr_t slide) {
 
 __attribute__((constructor(0)))
 static void nd_init(void) {
+    NDWindowMarginInit();
     if (!NDIsDockProcess()) return;
     _dyld_register_func_for_add_image(nd_on_image_added);
     NDInstallHooks();

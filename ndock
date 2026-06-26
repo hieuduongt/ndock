@@ -1,0 +1,215 @@
+#!/usr/bin/env -u DYLD_INSERT_LIBRARIES bash
+set -e
+
+# Nếu bị dyld crash: source ./recover.zsh uninstall
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ ! -f "$SCRIPT_DIR/NDock.dylib" ]; then
+  if [ -f "$SCRIPT_DIR/bootstrap/NDock.stub.dylib" ]; then
+    cp "$SCRIPT_DIR/bootstrap/NDock.stub.dylib" "$SCRIPT_DIR/NDock.dylib"
+  fi
+fi
+
+NDOCK_HOME="${NDOCK_HOME:-$HOME/Library/Application Support/N-Dock}"
+DYLIB="$NDOCK_HOME/NDock.dylib"
+BOOT_SCRIPT="$NDOCK_HOME/boot.sh"
+PLIST="$HOME/Library/LaunchAgents/com.ndock.inject.plist"
+DOCK_BIN="/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
+GUI_DOMAIN="gui/$(id -u)"
+
+nd_stage_dylib() {
+  mkdir -p "$NDOCK_HOME"
+  if [ -f "$SCRIPT_DIR/NDock.dylib" ]; then
+    cp -f "$SCRIPT_DIR/NDock.dylib" "$DYLIB"
+  else
+    echo "Không tìm thấy NDock.dylib — chạy './ndock build' hoặc 'source ./recover.zsh build' trước." >&2
+    exit 1
+  fi
+  codesign -f -s - "$DYLIB" 2>/dev/null || true
+}
+
+nd_write_boot_script() {
+  cat > "$BOOT_SCRIPT" <<'EOF'
+#!/usr/bin/env -u DYLD_INSERT_LIBRARIES bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+DYLIB="$DIR/NDock.dylib"
+[ -f "$DYLIB" ] || exit 0
+launchctl setenv DYLD_INSERT_LIBRARIES "$DYLIB"
+sleep 2
+/usr/bin/killall Dock 2>/dev/null || true
+EOF
+  chmod +x "$BOOT_SCRIPT"
+}
+
+nd_write_default_settings() {
+  local settings="$NDOCK_HOME/settings.plist"
+  [ -f "$settings" ] && return 0
+  mkdir -p "$NDOCK_HOME"
+  cat > "$settings" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>windowMarginPerSide</key>
+  <real>5</real>
+  <key>dockMarginPerSide</key>
+  <real>5</real>
+</dict>
+</plist>
+EOF
+}
+
+nd_require_installed() {
+  [ -f "$DYLIB" ] || { echo "Chưa cài — chạy './ndock install' trước." >&2; exit 1; }
+}
+
+nd_check_prereqs() {
+  echo "=== Kiểm tra ==="
+  csrutil status 2>&1 | head -1
+  LV=$(defaults read /Library/Preferences/com.apple.security.libraryvalidation.plist DisableLibraryValidation 2>/dev/null || echo "0")
+  echo "DisableLibraryValidation = $LV"
+  if [ "$LV" != "1" ]; then
+    echo "Cần: sudo defaults write /Library/Preferences/com.apple.security.libraryvalidation.plist DisableLibraryValidation -bool true && sudo reboot"
+  fi
+}
+
+nd_install_launch_agent() {
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ndock.inject</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$BOOT_SCRIPT</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+EOF
+
+  launchctl bootout "$GUI_DOMAIN/com.ndock.inject" 2>/dev/null || true
+  launchctl bootstrap "$GUI_DOMAIN" "$PLIST"
+  launchctl enable "$GUI_DOMAIN/com.ndock.inject"
+  launchctl kickstart -k "$GUI_DOMAIN/com.ndock.inject" 2>/dev/null || true
+  launchctl setenv DYLD_INSERT_LIBRARIES "$DYLIB"
+}
+
+nd_restart_dock() {
+  killall Dock 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    pgrep -x Dock >/dev/null && break
+    sleep 0.2
+  done
+  sleep 2
+  if ! pgrep -x Dock >/dev/null; then
+    env DYLD_INSERT_LIBRARIES="$DYLIB" "$DOCK_BIN" &
+    sleep 2
+  fi
+  pgrep -x Dock >/dev/null || { echo "Không tìm thấy Dock."; exit 1; }
+  echo "Dock pid=$(pgrep -x Dock | head -1)"
+}
+
+nd_resolve_app() {
+  local app="$1"
+  local b
+  b=$(mdfind "kMDItemKind == 'Application' && kMDItemDisplayName == '$app'" 2>/dev/null | head -1)
+  for candidate in "$b" "/System/Applications/${app}.app" "/Applications/${app}.app"; do
+    [ -n "$candidate" ] && [ -d "$candidate" ] && { echo "$candidate"; return 0; }
+  done
+  return 1
+}
+
+nd_open_app() {
+  nd_require_installed
+  if [ "$1" != "-a" ] || [ -z "$2" ]; then
+    echo "Dùng: $0 open -a TênApp" >&2
+    exit 1
+  fi
+  local app="$2"
+  shift 2
+  local bundle exec
+  bundle=$(nd_resolve_app "$app") || { echo "Không tìm thấy app: $app" >&2; exit 1; }
+  exec="$bundle/Contents/MacOS/$app"
+  if [ ! -x "$exec" ]; then
+    exec=$(find "$bundle/Contents/MacOS" -maxdepth 1 -perm +111 -type f 2>/dev/null | head -1)
+  fi
+  [ -x "$exec" ] || { echo "Không tìm thấy binary trong $bundle" >&2; exit 1; }
+  exec env DYLD_INSERT_LIBRARIES="$DYLIB" "$exec" "$@"
+}
+
+case "${1:-}" in
+  build)
+    shift
+    exec "$SCRIPT_DIR/build.sh" "$@"
+    ;;
+
+  app)
+    "$SCRIPT_DIR/build-app.sh"
+    ;;
+
+  package)
+    "$SCRIPT_DIR/package.sh"
+    ;;
+
+  install)
+    nd_check_prereqs
+    nd_stage_dylib
+    nd_write_default_settings
+    nd_write_boot_script
+    nd_install_launch_agent
+    echo "Cài tại: $NDOCK_HOME"
+    echo "DYLD_INSERT_LIBRARIES=$DYLIB"
+    nd_restart_dock
+    echo ""
+    echo "Đã cài N-Dock."
+    echo "Mở app: ./ndock open -a Safari"
+    echo "Gỡ: ./ndock uninstall"
+    ;;
+
+  uninstall)
+    launchctl bootout "$GUI_DOMAIN/com.ndock.inject" 2>/dev/null || true
+    rm -f "$PLIST"
+    launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null || true
+    rm -rf "$NDOCK_HOME"
+    killall Dock 2>/dev/null || true
+    echo "Đã gỡ N-Dock."
+    echo "DYLD_INSERT_LIBRARIES đã unset."
+    ;;
+
+  open)
+    shift
+    nd_open_app "$@"
+    ;;
+
+  status)
+    echo "NDOCK_HOME=$NDOCK_HOME"
+    echo "DYLIB=$DYLIB ($([ -f "$DYLIB" ] && echo OK || echo missing))"
+    echo "LaunchAgent=$([ -f "$PLIST" ] && echo OK || echo missing)"
+    echo "DYLD_INSERT_LIBRARIES=$(launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null || echo '(unset)')"
+    ;;
+
+  sipcheck)
+    csrutil status
+    defaults read /Library/Preferences/com.apple.security.libraryvalidation.plist DisableLibraryValidation 2>/dev/null \
+      || echo "DisableLibraryValidation chưa bật"
+    ;;
+
+  *)
+    echo "N-Dock"
+    echo "  $0 install     — cài vào ~/Library/Application Support/N-Dock"
+    echo "  $0 uninstall   — gỡ hoàn toàn"
+    echo "  $0 open -a App — mở app kèm dylib"
+    echo "  $0 status      — kiểm tra trạng thái"
+    echo "  $0 build|app|package — build (dev)"
+    echo ""
+    echo "Nếu mọi lệnh crash dyld: source ./recover.zsh uninstall"
+    ;;
+esac
+
+exit 0
