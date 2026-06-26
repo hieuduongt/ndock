@@ -29,6 +29,7 @@ swiftc "$DIR/App/NDockCore.swift" "$DIR/App/main.swift" \
   -target arm64-apple-macos12.0 \
   -framework AppKit \
   -framework Foundation \
+  -Xlinker -sectcreate -Xlinker __RESTRICT -Xlinker __restrict -Xlinker /dev/null \
   -o "$BIN"
 
 cp App/Info.plist "$APP/Contents/Info.plist"

@@ -234,6 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 private func runCLI() -> Never {
+    NDockCore.ensureInjectPathSafe()
     let args = Array(CommandLine.arguments.dropFirst())
     guard let cmd = args.first else {
         fputs("""
@@ -275,6 +276,7 @@ private func runCLI() -> Never {
 if CommandLine.arguments.count > 1 {
     runCLI()
 } else {
+    NDockCore.ensureInjectPathSafe()
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate

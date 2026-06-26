@@ -41,8 +41,11 @@ ndock_uninstall() {
   launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null
   command killall Dock 2>/dev/null
   sleep 2
-  command rm -rf "$NDOCK_HOME"
+  command rm -f "$NDOCK_HOME/boot.sh" "$NDOCK_HOME/settings.plist"
   print "Đã gỡ N-Dock."
+  if [[ -f "$NDOCK_HOME/NDock.dylib" ]]; then
+    print "Giữ stub tại $NDOCK_HOME/NDock.dylib"
+  fi
   print "DYLD_INSERT_LIBRARIES=$(launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null || print '(unset)')"
 }
 

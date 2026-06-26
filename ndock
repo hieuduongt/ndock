@@ -111,21 +111,22 @@ nd_uninstall() {
   killall Dock 2>/dev/null || true
   sleep 2
 
+  rm -f "$BOOT_SCRIPT" "$NDOCK_HOME/settings.plist"
+
   local left
   left=$(launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null || true)
 
+  echo "Đã gỡ N-Dock."
   if [ -n "$left" ]; then
-    echo "Đã gỡ N-Dock (LaunchAgent + Dock)."
     echo "Cảnh báo: DYLD_INSERT_LIBRARIES vẫn trỏ tới dylib."
+  fi
+  if [ -f "$DYLIB" ]; then
     echo "Giữ stub tại $DYLIB để tránh crash — logout/login sẽ dọn sạch."
     echo "Hoặc chạy: launchctl unsetenv DYLD_INSERT_LIBRARIES"
-    return 0
+  else
+    echo "Lỗi: thiếu stub tại $DYLIB — logout/login ngay."
   fi
-
-  rm -rf "$NDOCK_HOME"
-
-  echo "Đã gỡ N-Dock."
-  echo "DYLD_INSERT_LIBRARIES đã unset."
+  return 0
 }
 
 nd_check_prereqs() {

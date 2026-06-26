@@ -109,13 +109,57 @@ enum NDockCore {
 
     static func deploySafeDylibPlaceholder() throws {
         let source = bundledStubDylib ?? bundledDylib
-        guard let source else { return }
+        guard let source else {
+            throw NDockError.missingBundledDylib
+        }
         try FileManager.default.createDirectory(at: ndockHome, withIntermediateDirectories: true)
         if FileManager.default.fileExists(atPath: installedDylib.path) {
             try? FileManager.default.removeItem(at: installedDylib)
         }
         try FileManager.default.copyItem(at: source, to: installedDylib)
         codesign(installedDylib)
+    }
+
+    /// launchctl getenv — nil khi unset hoặc lỗi (không nhầm với chuỗi rỗng).
+    static func launchctlGetenv(_ name: String) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        proc.arguments = ["getenv", name]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let out = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return out.isEmpty ? nil : out
+    }
+
+    static func clearInjectEnvironment() {
+        for _ in 0..<3 {
+            try? runSilent("/bin/launchctl", ["unsetenv", "DYLD_INSERT_LIBRARIES"])
+            if launchctlGetenv("DYLD_INSERT_LIBRARIES") == nil { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+    }
+
+    static func pruneInstallArtifacts() {
+        try? FileManager.default.removeItem(at: bootScript)
+        try? FileManager.default.removeItem(at: NDockSettings.settingsURL)
+    }
+
+    /// Khi DYLD vẫn trỏ install path nhưng file thiếu — khôi phục stub từ bundle (sau khi app đã mở).
+    static func ensureInjectPathSafe() {
+        guard let dyld = launchctlGetenv("DYLD_INSERT_LIBRARIES") else { return }
+        guard dyld == installedDylib.path else { return }
+        guard !FileManager.default.fileExists(atPath: installedDylib.path) else { return }
+        try? deploySafeDylibPlaceholder()
     }
 
     static var guiDomain: String { "gui/\(getuid())" }
@@ -352,30 +396,44 @@ enum NDockCore {
         try? runSilent("/bin/launchctl", ["bootout", guiDomain + "/com.ndock.inject"])
         try? FileManager.default.removeItem(at: launchAgentPlist)
 
-        try? deploySafeDylibPlaceholder()
+        // Luôn đặt stub TRƯỚC khi unset — tránh mọi app (kể cả NDock.app) crash tại dyld.
+        try deploySafeDylibPlaceholder()
 
-        try? runSilent("/bin/launchctl", ["unsetenv", "DYLD_INSERT_LIBRARIES"])
+        clearInjectEnvironment()
+        pruneInstallArtifacts()
         try? runSilent("/usr/bin/killall", ["Dock"])
         Thread.sleep(forTimeInterval: 2.0)
-        try? FileManager.default.removeItem(at: ndockHome)
 
-        let env = (try? run("/bin/launchctl", ["getenv", "DYLD_INSERT_LIBRARIES"])) ?? ""
-        if !env.isEmpty {
-            return """
-            Đã gỡ N-Dock.
-            Cảnh báo: DYLD_INSERT_LIBRARIES vẫn còn.
-            Mở Terminal mới và chạy: launchctl unsetenv DYLD_INSERT_LIBRARIES
-            Hoặc: source ./recover.zsh uninstall
+        let dylibOK = FileManager.default.fileExists(atPath: installedDylib.path)
+        let envLeft = launchctlGetenv("DYLD_INSERT_LIBRARIES")
+
+        var msg = "Đã gỡ N-Dock."
+        if let envLeft {
+            msg += """
+
+
+            Cảnh báo: DYLD_INSERT_LIBRARIES vẫn trỏ tới:
+            \(envLeft)
             """
         }
-        return "Đã gỡ N-Dock."
+        if dylibOK {
+            msg += """
+
+
+            Giữ stub tại \(installedDylib.path) để tránh crash.
+            Logout/login sẽ dọn DYLD; hoặc: launchctl unsetenv DYLD_INSERT_LIBRARIES
+            """
+        } else {
+            msg += "\n\nLỗi: không ghi được stub dylib — logout/login ngay."
+        }
+        return msg
     }
 
     static func statusReport() -> String {
         let dylibOK = FileManager.default.fileExists(atPath: installedDylib.path) ? "OK" : "missing"
         let agentOK = FileManager.default.fileExists(atPath: launchAgentPlist.path) ? "OK" : "missing"
         let autoOK = isAutoInstallEnabled() ? "ON" : "OFF"
-        let env = (try? run("/bin/launchctl", ["getenv", "DYLD_INSERT_LIBRARIES"])) ?? "(unset)"
+        let env = launchctlGetenv("DYLD_INSERT_LIBRARIES") ?? "(unset)"
         let s = NDockSettings.load()
         return """
         NDOCK_HOME=\(ndockHome.path)
