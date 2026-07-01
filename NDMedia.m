@@ -8,6 +8,7 @@ typedef void (^NDMRIsPlayingCompletion)(Boolean isPlaying);
 typedef void (*NDMRGetNowPlayingInfoFn)(dispatch_queue_t queue, NDMRNowPlayingCompletion completion);
 typedef void (*NDMRGetIsPlayingFn)(dispatch_queue_t queue, NDMRIsPlayingCompletion completion);
 typedef void (*NDMRRegisterFn)(dispatch_queue_t queue);
+typedef Boolean (*NDMRSendCommandFn)(int command, CFDictionaryRef userInfo);
 
 static CALayer *gArtwork = NULL;
 static CALayer *gTitleClip = NULL;
@@ -25,6 +26,7 @@ static struct {
     NDMRGetNowPlayingInfoFn getInfo;
     NDMRGetIsPlayingFn getIsPlaying;
     NDMRRegisterFn registerNotifications;
+    NDMRSendCommandFn sendCommand;
     CFStringRef keyTitle;
     CFStringRef keyArtist;
     CFStringRef keyArtwork;
@@ -74,6 +76,15 @@ static dispatch_source_t gMarqueeTimer = NULL;
 static NSString *gTitleMarqueeKey = nil;
 static NSString *gArtistMarqueeKey = nil;
 
+static const int kNDMRCommandTogglePlayPause = 2;
+static const int kNDMRCommandNextTrack = 4;
+static const int kNDMRCommandPreviousTrack = 5;
+
+static CGRect gHitPrev = {0};
+static CGRect gHitPlay = {0};
+static CGRect gHitNext = {0};
+static const CGFloat kNDMediaHitSlopPt = 3.0;
+
 static void NDFetchNowPlaying(void);
 
 static void NDSetText(CATextLayer *layer, NSString *text) {
@@ -117,6 +128,7 @@ static BOOL NDLoadMediaRemote(void) {
     gMR.getIsPlaying = (NDMRGetIsPlayingFn)dlsym(gMRHandle, "MRMediaRemoteGetNowPlayingApplicationIsPlaying");
     gMR.registerNotifications =
         (NDMRRegisterFn)dlsym(gMRHandle, "MRMediaRemoteRegisterForNowPlayingNotifications");
+    gMR.sendCommand = (NDMRSendCommandFn)dlsym(gMRHandle, "MRMediaRemoteSendCommand");
     gMR.keyTitle = NDLoadMRKey("kMRMediaRemoteNowPlayingInfoTitle");
     gMR.keyArtist = NDLoadMRKey("kMRMediaRemoteNowPlayingInfoArtist");
     gMR.keyArtwork = NDLoadMRKey("kMRMediaRemoteNowPlayingInfoArtworkData");
@@ -372,12 +384,14 @@ static void NDApplyCachedToLayers(void) {
         NDSetText(gPlay, @"▶");
         NDSetText(gNext, @"⏭");
         NDSetArtwork(nil);
+        NDRelayoutMediaHorizControls();
         return;
     }
     NDSetText(gPrev, @"⏮");
     NDSetText(gPlay, gCachedPlaying ? @"⏸" : @"▶");
     NDSetText(gNext, @"⏭");
     NDSetArtwork(gCachedArtwork);
+    NDRelayoutMediaHorizControls();
 }
 
 static void NDApplyNowPlaying(CFDictionaryRef info, Boolean isPlaying) {
@@ -467,6 +481,95 @@ static void NDInstallNowPlayingObservers(void) {
         CFNotificationCenterAddObserver(darwin, NULL, NDNowPlayingNotify, gMR.noteAppChanged,
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     }
+}
+
+static BOOL NDMRSend(int command) {
+    if (!gMR.sendCommand)
+        return NO;
+    Boolean ok = gMR.sendCommand(command, NULL);
+    return ok ? YES : NO;
+}
+
+static BOOL NDSendMediaKeyFallback(NDMediaAction action) {
+    (void)action;
+    return NO;
+}
+
+BOOL NDMediaPerformAction(NDMediaAction action) {
+    static CFAbsoluteTime sLastActionTime = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - sLastActionTime < 0.35)
+        return YES;
+    sLastActionTime = now;
+
+    if (!NDLoadMediaRemote())
+        return NO;
+
+    int command = 0;
+    switch (action) {
+        case NDMediaActionPrevious:
+            command = kNDMRCommandPreviousTrack;
+            break;
+        case NDMediaActionTogglePlayPause:
+            command = kNDMRCommandTogglePlayPause;
+            break;
+        case NDMediaActionNext:
+            command = kNDMRCommandNextTrack;
+            break;
+    }
+
+    BOOL sent = NDMRSend(command);
+    if (!sent)
+        sent = NDSendMediaKeyFallback(action);
+    if (!sent)
+        return NO;
+
+    if (action == NDMediaActionTogglePlayPause && gHasCache) {
+        gCachedPlaying = !gCachedPlaying;
+        NDApplyCachedToLayers();
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NDFetchNowPlaying();
+    });
+    return YES;
+}
+
+void NDMediaSetControlHitRects(CGRect prev, CGRect play, CGRect next) {
+    gHitPrev = prev;
+    gHitPlay = play;
+    gHitNext = next;
+}
+
+static BOOL NDPointInHitRect(CGPoint p, CGRect r) {
+    if (CGRectIsEmpty(r)) return NO;
+    return CGRectContainsPoint(CGRectInset(r, -kNDMediaHitSlopPt, -kNDMediaHitSlopPt), p);
+}
+
+BOOL NDMediaHandleScreenClick(CGPoint cocoaScreenPt) {
+    if (NDPointInHitRect(cocoaScreenPt, gHitPrev))
+        return NDMediaPerformAction(NDMediaActionPrevious);
+    if (NDPointInHitRect(cocoaScreenPt, gHitPlay))
+        return NDMediaPerformAction(NDMediaActionTogglePlayPause);
+    if (NDPointInHitRect(cocoaScreenPt, gHitNext))
+        return NDMediaPerformAction(NDMediaActionNext);
+    return NO;
+}
+
+static BOOL NDShellPointHits(CATextLayer *btn, CGPoint shellPoint) {
+    if (!btn || btn.hidden) return NO;
+    return CGRectContainsPoint(CGRectInset(btn.frame, -kNDMediaHitSlopPt, -kNDMediaHitSlopPt), shellPoint);
+}
+
+BOOL NDMediaHandleShellClick(CGPoint shellPoint) {
+    if (NDShellPointHits(gPrev, shellPoint))
+        return NDMediaPerformAction(NDMediaActionPrevious);
+    if (NDShellPointHits(gPlay, shellPoint))
+        return NDMediaPerformAction(NDMediaActionTogglePlayPause);
+    if (NDShellPointHits(gNext, shellPoint))
+        return NDMediaPerformAction(NDMediaActionNext);
+    return NO;
 }
 
 void NDMediaBindLayers(CALayer *artwork, CALayer *titleClip, CATextLayer *title,

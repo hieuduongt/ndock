@@ -7,6 +7,7 @@
 #import "NDConfig.h"
 #import "NDStats.h"
 #import "NDMedia.h"
+#import "NDMediaControls.h"
 #import <math.h>
 
 void NDWindowMarginInit(void);
@@ -57,8 +58,8 @@ static void_fn orig_floorLayout = NULL;
 
 static CGRect gNDFloorFrame = {0};
 static BOOL gNDFloorFrameValid = NO;
-static id gNDDockBar = nil;
-static CALayer *gNDFloorLayerRef = NULL;
+id gNDDockBar = nil;
+CALayer *gNDFloorLayerRef = NULL;
 static CALayer *gNDLeftShell = NULL;
 static CALayer *gNDRightShell = NULL;
 static CALayer *gNDProbeIcon = NULL;
@@ -70,24 +71,67 @@ static BOOL gNDWidgetLayoutPending = NO;
 static CATextLayer *gNDDiskLayer = NULL;
 static CATextLayer *gNDRamLayer = NULL;
 static CATextLayer *gNDChipLayer = NULL;
-static CALayer *gNDMediaProbeIcon = NULL;
+CALayer *gNDMediaProbeIcon = NULL;
 static CALayer *gNDMediaProbeBgLayer = NULL;
 static CALayer *gNDMediaArtLayer = NULL;
 static CALayer *gNDMediaTitleClip = NULL;
 static CALayer *gNDMediaArtistClip = NULL;
 static CATextLayer *gNDMediaTitleLayer = NULL;
 static CATextLayer *gNDMediaArtistLayer = NULL;
-static CATextLayer *gNDMediaPrevLayer = NULL;
-static CATextLayer *gNDMediaPlayLayer = NULL;
-static CATextLayer *gNDMediaNextLayer = NULL;
+CATextLayer *gNDMediaPrevLayer = NULL;
+CATextLayer *gNDMediaPlayLayer = NULL;
+CATextLayer *gNDMediaNextLayer = NULL;
 static CATextLayer *gNDNetUpLayer = NULL;
 static CATextLayer *gNDNetDownLayer = NULL;
 static BOOL gNDInWidgetLayout = NO;
+static BOOL gNDMediaCompactLayout = NO;
+static BOOL gNDHorizCtrlFramesValid = NO;
+static CGRect gNDHorizCtrlPrev = {0};
+static CGRect gNDHorizCtrlPlay = {0};
+static CGRect gNDHorizCtrlNext = {0};
+static CGFloat gNDHorizCtrlFont = 0;
+static CFAbsoluteTime gNDMediaClickSuppressLayoutUntil = 0;
+static CFAbsoluteTime gNDLayoutFreezeUntil = 0;
 static uint64_t gNDRelayoutNonce = 0;
-static uint64_t gNDSettleNonce = 0;
 static NSInteger gNDLastBarOrientation = -1;
 static NSInteger gNDLastFloorShapeVertical = -1;
 static CFAbsoluteTime gNDOrientationSettleUntil = 0;
+static CGRect gNDStableStatsHost = {0};
+static CGRect gNDStableNetHost = {0};
+static CGRect gNDStableMediaHost = {0};
+static CGRect gNDStableFloorScreen = {0};
+static BOOL gNDStableLayoutValid = NO;
+static BOOL gNDStableCompactVertical = NO;
+static uint64_t gNDSettleNonce = 0;
+static CFAbsoluteTime gNDLastAnimLayout = 0;
+/// Watchdog re-show: level-triggered, luôn thử lại tới khi layout xong.
+/// Không bị nonce huỷ như burst/settle → widget không kẹt ẩn khi đổi dock liên tiếp.
+static BOOL gNDNeedWidgetReshow = NO;
+static BOOL gNDReshowWatchdogActive = NO;
+
+static void NDInvalidateStableLayout(const char *why) {
+    (void)why;
+    if (!gNDStableLayoutValid) return;
+    gNDStableLayoutValid = NO;
+}
+
+/// Giới hạn tần suất layout do animation (setFloorFrame/layoutSublayers ~60fps).
+/// Cap ~20fps để mượt mà nhẹ CPU; burst/settle/watchdog KHÔNG dùng throttle này.
+static BOOL NDAnimLayoutThrottled(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - gNDLastAnimLayout < 0.05) return YES;
+    gNDLastAnimLayout = now;
+    return NO;
+}
+
+static BOOL NDFloorScreenMoved(CGRect a, CGRect b) {
+    if (CGRectIsEmpty(a) || CGRectIsEmpty(b)) return YES;
+    return hypot(a.origin.x - b.origin.x, a.origin.y - b.origin.y) > 24.0
+        || fabs(a.size.width - b.size.width) > 24.0
+        || fabs(a.size.height - b.size.height) > 24.0;
+}
+static CGRect gNDLastFloorInHost = {0};
+static CFAbsoluteTime gNDDockBootTime = 0;
 
 static BOOL NDInOrientationSettle(void) {
     return CFAbsoluteTimeGetCurrent() < gNDOrientationSettleUntil;
@@ -104,8 +148,11 @@ static BOOL NDIsVerticalFloorRect(CGRect rect) {
 static BOOL NDIsHorizontalDock(id dockBar);
 static void NDFloorLayoutSize(CALayer *floor, CGFloat *outW, CGFloat *outH);
 static BOOL NDFloorShapeMatchesDock(BOOL dockHorizontal, CGFloat floorW, CGFloat floorH);
+static int NDCountDockTiles(CALayer *host, CALayer *floor);
+static void NDHideProbeWidgets(void);
 
 /// Dock phải: barOrientation có thể vẫn là bottom trong khi floor đã dọc — tin floor khi lệch.
+/// Dock trái/phải đổi từ bottom: floor ngang lag — tin bar (vertical).
 static BOOL NDEffectiveDockHorizontal(id dockBar, CALayer *floor) {
     BOOL barH = NDIsHorizontalDock(dockBar);
     if (!gNDFloorFrameValid) {
@@ -117,9 +164,25 @@ static BOOL NDEffectiveDockHorizontal(id dockBar, CALayer *floor) {
         }
         return barH;
     }
-    if (NDFloorShapeMatchesDock(barH, gNDFloorFrame.size.width, gNDFloorFrame.size.height))
+    CGFloat w = gNDFloorFrame.size.width, h = gNDFloorFrame.size.height;
+    if (NDFloorShapeMatchesDock(barH, w, h))
         return barH;
+    if (!barH)
+        return NO;
     return !NDIsVerticalFloorRect(gNDFloorFrame);
+}
+
+/// Chọn nhánh layout ngang/dọc — đồng bộ với bar khi floor đang transition.
+static BOOL NDLayoutHorizontal(id dockBar, BOOL metricsHorizontal) {
+    BOOL barH = NDIsHorizontalDock(dockBar);
+    if (!gNDFloorFrameValid)
+        return barH;
+    CGFloat w = gNDFloorFrame.size.width, h = gNDFloorFrame.size.height;
+    if (NDFloorShapeMatchesDock(barH, w, h))
+        return barH;
+    if (!barH)
+        return NO;
+    return metricsHorizontal;
 }
 
 static BOOL NDIsMainFloorLayer(CALayer *floor) {
@@ -131,6 +194,15 @@ static BOOL NDIsMainFloorLayer(CALayer *floor) {
     BOOL useVertical = NDIsVerticalFloorRect(gNDFloorFrame);
     if (NDInOrientationSettle() && gNDDockBar)
         useVertical = !NDEffectiveDockHorizontal(gNDDockBar, floor);
+
+    {
+        CALayer *host = floor.superlayer;
+        BOOL boundsVertical = h > w * 1.12;
+        if (host && NDCountDockTiles(host, floor) > 0 && boundsVertical != useVertical) {
+            w = gNDFloorFrame.size.width;
+            h = gNDFloorFrame.size.height;
+        }
+    }
 
     if (useVertical) {
         if (h < kNDMinRealSpan || w < kNDWidgetMinHeightPt) return NO;
@@ -187,6 +259,7 @@ static CGFloat NDVerticalGlassOuterSign(id dockBar, CALayer *tile) {
 static BOOL NDGhostRisk(BOOL layoutHorizontal, CGRect floorInHost,
                         CGRect leftProbe, CGRect rightProbe) {
     if (!layoutHorizontal) return NO;
+    if (NDInOrientationSettle()) return NO;
     BOOL floorVertical = floorInHost.size.height > floorInHost.size.width * 1.12;
     if (floorVertical) return YES;
     if (leftProbe.size.width > 1.0
@@ -195,12 +268,55 @@ static BOOL NDGhostRisk(BOOL layoutHorizontal, CGRect floorInHost,
     if (rightProbe.size.width > 1.0
         && rightProbe.size.height > rightProbe.size.width * 1.4)
         return YES;
-    if (gNDMediaProbeIcon && !gNDMediaProbeIcon.hidden) {
+    if (!gNDMediaCompactLayout && gNDMediaProbeIcon && !gNDMediaProbeIcon.hidden) {
         CGRect mp = gNDMediaProbeIcon.frame;
         if (mp.size.width > 1.0 && mp.size.height > mp.size.width * 1.4)
             return YES;
     }
     return NO;
+}
+
+static void NDNoteMediaButtonClick(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    gNDMediaClickSuppressLayoutUntil = now + 0.45;
+    gNDLayoutFreezeUntil = now + 1.50;
+}
+
+void NDNoteMediaControlActivated(void) {
+    NDNoteMediaButtonClick();
+}
+
+static BOOL NDShouldSuppressWidgetLayout(void) {
+    return CFAbsoluteTimeGetCurrent() < gNDMediaClickSuppressLayoutUntil;
+}
+
+static BOOL NDShouldFreezeWidgetHosts(BOOL layoutHorizontal) {
+    return !layoutHorizontal
+        && gNDStableLayoutValid
+        && CFAbsoluteTimeGetCurrent() < gNDLayoutFreezeUntil;
+}
+
+static void NDScheduleWidgetLayoutForce(id dockBar);
+static void NDScheduleWidgetRelayoutBurst(id dockBar);
+static void NDScheduleOrientationSettleRetry(id dockBar);
+
+static void NDDeferLayoutUntilUnsuppressed(id dockBar, void (^block)(id)) {
+    id bar = dockBar ?: gNDDockBar;
+    if (!bar || !block) return;
+    if (!NDShouldSuppressWidgetLayout()) {
+        block(bar);
+        return;
+    }
+    CFAbsoluteTime delay = gNDMediaClickSuppressLayoutUntil - CFAbsoluteTimeGetCurrent() + 0.06;
+    if (delay < 0.05) delay = 0.05;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (NDShouldSuppressWidgetLayout()) {
+            NDDeferLayoutUntilUnsuppressed(bar, block);
+            return;
+        }
+        block(bar);
+    });
 }
 
 static void NDLayoutTextRows(CALayer *shell, CATextLayer *const *rows, int count);
@@ -210,6 +326,7 @@ static void NDLayoutMediaHorizontal(CALayer *shell, CGFloat topIn, CGFloat botIn
 static void NDLayoutMediaCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR);
 static CGFloat NDHorizontalMediaContentWidth(void);
 static BOOL NDIsMediaShellLayer(CALayer *sub);
+static void NDUpdateMediaControlHitRects(CALayer *host);
 static CGRect NDFloorRectForWidgets(CALayer *floor, CALayer *host, BOOL dockHorizontal,
                                     const char **outSource);
 static CGRect NDTileVisualRectInHost(CALayer *tile, CALayer *host);
@@ -260,22 +377,79 @@ static CGFloat NDMediaVerticalContentHeight(void) {
     return 2.0 * lineH + 3.0 * ctrlLineH + 2.0 * kNDMediaPadPt;
 }
 
+static BOOL NDIsDockTileLayer(CALayer *layer) {
+    if (!layer) return NO;
+    const char *cn = object_getClassName(layer);
+    return cn && strstr(cn, "DOCKTileLayer") != NULL;
+}
+
+static int NDCountDockTiles(CALayer *host, CALayer *floor) {
+    int n = 0;
+    NSArray *roots = host ? @[ host ] : @[];
+    if (floor && floor != host)
+        roots = [roots arrayByAddingObject:floor];
+    for (CALayer *root in roots) {
+        for (CALayer *s in root.sublayers) {
+            if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
+                || s == gNDLeftShell || s == gNDRightShell) continue;
+            if (!NDIsDockTileLayer(s)) continue;
+            CGRect f = s.frame;
+            if (f.size.width < 4.0 || f.size.height < 4.0) continue;
+            n++;
+        }
+    }
+    return n;
+}
+
+static BOOL NDIsFloorLayerClass(CALayer *layer) {
+    if (!layer) return NO;
+    const char *cn = object_getClassName(layer);
+    return cn && strstr(cn, "ModernFloorLayer") != NULL;
+}
+
+/// DFS tìm ModernFloorLayer mà host của nó CÓ dock tile — dùng để tự sửa
+/// gNDFloorLayerRef bị stale (đổi dock in-process → floor cũ teardown, host 0 tile).
+static CALayer *NDSearchFloorWithTiles(CALayer *node, int depth) {
+    if (!node || depth > 7) return NULL;
+    if (NDIsFloorLayerClass(node) && NDCountDockTiles(node.superlayer, node) > 0)
+        return node;
+    for (CALayer *s in node.sublayers) {
+        CALayer *r = NDSearchFloorWithTiles(s, depth + 1);
+        if (r) return r;
+    }
+    return NULL;
+}
+
+/// Trả floor layer "sống" (host có tile). NULL nếu không tìm thấy.
+static CALayer *NDRediscoverFloorLayer(void) {
+    CALayer *root = gNDFloorLayerRef;
+    if (!root) return NULL;
+    int up = 0;
+    while (root.superlayer && up < 8) { root = root.superlayer; up++; }
+    return NDSearchFloorWithTiles(root, 0);
+}
+
 static CALayer *NDEndmostValidTile(CALayer *host, BOOL topEnd) {
     if (!host) return NULL;
     CALayer *best = NULL;
     CGFloat bestY = topEnd ? CGFLOAT_MAX : -CGFLOAT_MAX;
-    for (CALayer *s in host.sublayers) {
-        if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
-            || s == gNDLeftShell || s == gNDRightShell) continue;
-        if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
-        CGRect f = s.frame;
-        if (f.size.width < 8.0 || f.size.height < 8.0) continue;
-        if (f.size.height > 256.0 || f.size.width > 256.0) continue;
-        CGFloat y = topEnd ? CGRectGetMinY(f) : CGRectGetMaxY(f);
-        if (topEnd) {
-            if (y < bestY) { bestY = y; best = s; }
-        } else {
-            if (y > bestY) { bestY = y; best = s; }
+    NSArray *roots = @[ host ];
+    if (gNDFloorLayerRef && gNDFloorLayerRef.superlayer == host)
+        roots = @[ host, gNDFloorLayerRef ];
+    for (CALayer *root in roots) {
+        for (CALayer *s in root.sublayers) {
+            if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
+                || s == gNDLeftShell || s == gNDRightShell) continue;
+            if (!NDIsDockTileLayer(s)) continue;
+            CGRect f = s.frame;
+            if (f.size.width < 4.0 || f.size.height < 4.0) continue;
+            if (f.size.height > 256.0 || f.size.width > 256.0) continue;
+            CGFloat y = topEnd ? CGRectGetMinY(f) : CGRectGetMaxY(f);
+            if (topEnd) {
+                if (y < bestY) { bestY = y; best = s; }
+            } else {
+                if (y > bestY) { bestY = y; best = s; }
+            }
         }
     }
     return best;
@@ -285,16 +459,21 @@ static CALayer *NDRightmostValidTile(CALayer *host) {
     if (!host) return NULL;
     CALayer *best = NULL;
     CGFloat bestX = -CGFLOAT_MAX;
-    for (CALayer *s in host.sublayers) {
-        if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
-            || s == gNDLeftShell || s == gNDRightShell) continue;
-        if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
-        CGRect f = s.frame;
-        if (f.size.width < 8.0 || f.size.height < 8.0) continue;
-        if (f.size.height > 256.0 || f.size.width > 256.0) continue;
-        if (CGRectGetMaxX(f) > bestX) {
-            bestX = CGRectGetMaxX(f);
-            best = s;
+    NSArray *roots = @[ host ];
+    if (gNDFloorLayerRef && gNDFloorLayerRef.superlayer == host)
+        roots = @[ host, gNDFloorLayerRef ];
+    for (CALayer *root in roots) {
+        for (CALayer *s in root.sublayers) {
+            if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
+                || s == gNDLeftShell || s == gNDRightShell) continue;
+            if (!NDIsDockTileLayer(s)) continue;
+            CGRect f = s.frame;
+            if (f.size.width < 4.0 || f.size.height < 4.0) continue;
+            if (f.size.height > 256.0 || f.size.width > 256.0) continue;
+            if (CGRectGetMaxX(f) > bestX) {
+                bestX = CGRectGetMaxX(f);
+                best = s;
+            }
         }
     }
     return best;
@@ -304,16 +483,21 @@ static CALayer *NDLeftmostValidTile(CALayer *host) {
     if (!host) return NULL;
     CALayer *best = NULL;
     CGFloat bestX = CGFLOAT_MAX;
-    for (CALayer *s in host.sublayers) {
-        if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
-            || s == gNDLeftShell || s == gNDRightShell) continue;
-        if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
-        CGRect f = s.frame;
-        if (f.size.width < 8.0 || f.size.height < 8.0) continue;
-        if (f.size.height > 256.0 || f.size.width > 256.0) continue;
-        if (CGRectGetMinX(f) < bestX) {
-            bestX = CGRectGetMinX(f);
-            best = s;
+    NSArray *roots = @[ host ];
+    if (gNDFloorLayerRef && gNDFloorLayerRef.superlayer == host)
+        roots = @[ host, gNDFloorLayerRef ];
+    for (CALayer *root in roots) {
+        for (CALayer *s in root.sublayers) {
+            if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
+                || s == gNDLeftShell || s == gNDRightShell) continue;
+            if (!NDIsDockTileLayer(s)) continue;
+            CGRect f = s.frame;
+            if (f.size.width < 4.0 || f.size.height < 4.0) continue;
+            if (f.size.height > 256.0 || f.size.width > 256.0) continue;
+            if (CGRectGetMinX(f) < bestX) {
+                bestX = CGRectGetMinX(f);
+                best = s;
+            }
         }
     }
     return best;
@@ -327,7 +511,7 @@ static BOOL NDIconClusterX(CALayer *host, CGFloat *outMinX, CGFloat *outMaxX) {
     for (CALayer *s in host.sublayers) {
         if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
             || s == gNDLeftShell || s == gNDRightShell) continue;
-        if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
+        if (!NDIsDockTileLayer(s)) continue;
         CGRect f = s.frame;
         if (f.size.width < 8.0 || f.size.height < 8.0) continue;
         if (CGRectGetMinX(f) < minX) minX = CGRectGetMinX(f);
@@ -348,7 +532,7 @@ static BOOL NDIconClusterY(CALayer *host, CGFloat *outMinY, CGFloat *outMaxY) {
     for (CALayer *s in host.sublayers) {
         if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
             || s == gNDLeftShell || s == gNDRightShell) continue;
-        if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
+        if (!NDIsDockTileLayer(s)) continue;
         CGRect f = s.frame;
         if (f.size.width < 8.0 || f.size.height < 8.0) continue;
         if (CGRectGetMinY(f) < minY) minY = CGRectGetMinY(f);
@@ -558,6 +742,15 @@ static void NDSyncRightGlassWidget(CALayer *src, CGRect frame, BOOL compactVerti
 static void NDSyncMediaWidget(CALayer *shell, CALayer *bg, CALayer *src, CGRect frame,
                               BOOL compactVertical) {
     if (!shell || !src || !bg) return;
+    if (NDShouldSuppressWidgetLayout()
+        && shell.frame.size.width > 4.0 && shell.frame.size.height > 4.0) {
+        NDMediaRelayout();
+        NDRelayoutMediaHorizControls();
+        NDUpdateMediaControlHitRects(src.superlayer);
+        return;
+    }
+    gNDHorizCtrlFramesValid = NO;
+    gNDMediaCompactLayout = compactVertical;
     CALayer *host = src.superlayer;
     CGRect vf = NDTileVisualRectInHost(src, host);
     CGRect tf = src.frame;
@@ -640,6 +833,15 @@ static void NDSyncMediaWidget(CALayer *shell, CALayer *bg, CALayer *src, CGRect 
     else
         NDLayoutMediaHorizontal(shell, topIn, botIn);
     NDMediaRelayout();
+    NDRelayoutMediaHorizControls();
+    NDUpdateMediaControlHitRects(host);
+}
+
+static void NDUpdateMediaControlHitRects(CALayer *host) {
+    BOOL visible = gNDMediaProbeIcon && !gNDMediaProbeIcon.hidden;
+    NDMediaControlsSync(gNDDockBar, host, gNDMediaProbeIcon,
+                        gNDMediaPrevLayer, gNDMediaPlayLayer, gNDMediaNextLayer,
+                        visible, gNDFloorFrame, gNDLastFloorInHost, gNDFloorFrameValid);
 }
 
 static void NDSyncMediaIcon(CALayer *src, CGRect frame, BOOL compactVertical) {
@@ -790,9 +992,11 @@ static CGRect NDFloorRectForWidgets(CALayer *floor, CALayer *host, BOOL dockHori
                                                 gNDFloorFrame.size.width,
                                                 gNDFloorFrame.size.height);
     if (frameVertical && frameMatches) {
-        if (outSource) *outSource = "vert_match_origin";
-        return CGRectMake(measured.origin.x, measured.origin.y,
-                          gNDFloorFrame.size.width, gNDFloorFrame.size.height);
+        // Dock dọc (trái/phải): measured.origin.y trôi theo animation container
+        // (5 → 81 → 8000+), đẩy widget lệch/off-screen rồi bị ẩn. gNDFloorFrame
+        // là frame đã settle (screen coords, host≈screen) → ổn định, widget đứng yên.
+        if (outSource) *outSource = "vert_frame_stable";
+        return gNDFloorFrame;
     }
     if (outSource) *outSource = "gNDFloorFrame";
     return gNDFloorFrame;
@@ -928,26 +1132,26 @@ static void NDLayoutNetCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR)
     }
 }
 
-static void NDApplyMediaTextStyle(CATextLayer *row, CGRect frame, BOOL centered) {
-    if (!row) return;
-    row.wrapped = NO;
-    row.truncationMode = kCATruncationEnd;
-    row.alignmentMode = centered ? kCAAlignmentCenter : kCAAlignmentLeft;
-    row.fontSize = kNDWidgetFontSize;
-    row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDWidgetFontSize
-                                                       weight:NSFontWeightSemibold];
-    row.frame = frame;
+static void NDApplyMediaHorizCtrlStyle(CATextLayer *row, CGRect frame, CGFloat fontSize);
+
+void NDRelayoutMediaHorizControls(void) {
+    if (!gNDHorizCtrlFramesValid || gNDMediaCompactLayout) return;
+    NDApplyMediaHorizCtrlStyle(gNDMediaPrevLayer, gNDHorizCtrlPrev, gNDHorizCtrlFont);
+    NDApplyMediaHorizCtrlStyle(gNDMediaPlayLayer, gNDHorizCtrlPlay, gNDHorizCtrlFont);
+    NDApplyMediaHorizCtrlStyle(gNDMediaNextLayer, gNDHorizCtrlNext, gNDHorizCtrlFont);
 }
 
-static void NDApplyMediaCompactStyle(CATextLayer *row, CGRect frame, BOOL centered) {
-    if (!row) return;
-    row.wrapped = NO;
-    row.truncationMode = kCATruncationEnd;
-    row.alignmentMode = centered ? kCAAlignmentCenter : kCAAlignmentLeft;
-    row.fontSize = kNDWidgetCompactFontSize;
-    row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDWidgetCompactFontSize
-                                                       weight:NSFontWeightSemibold];
-    row.frame = frame;
+static void NDApplyHorizMediaControlFrames(CGFloat textX, CGFloat textW, CGFloat ctrlY, CGFloat ctrlH) {
+    CGFloat btnW = textW / 3.0;
+    CGFloat ctrlFont = MAX(kNDMediaCtrlFontSize, kNDMediaCtrlSideFontSize);
+    gNDHorizCtrlPrev = CGRectMake(textX, ctrlY, btnW, ctrlH);
+    gNDHorizCtrlPlay = CGRectMake(textX + btnW, ctrlY, btnW, ctrlH);
+    gNDHorizCtrlNext = CGRectMake(textX + 2.0 * btnW, ctrlY, btnW, ctrlH);
+    gNDHorizCtrlFont = ctrlFont;
+    gNDHorizCtrlFramesValid = YES;
+    NDApplyMediaHorizCtrlStyle(gNDMediaPrevLayer, gNDHorizCtrlPrev, ctrlFont);
+    NDApplyMediaHorizCtrlStyle(gNDMediaPlayLayer, gNDHorizCtrlPlay, ctrlFont);
+    NDApplyMediaHorizCtrlStyle(gNDMediaNextLayer, gNDHorizCtrlNext, ctrlFont);
 }
 
 static void NDApplyMediaHorizCtrlStyle(CATextLayer *row, CGRect frame, CGFloat fontSize) {
@@ -980,17 +1184,6 @@ static void NDApplyMediaHorizCtrlStyle(CATextLayer *row, CGRect frame, CGFloat f
     row.alignmentMode = kCAAlignmentCenter;
     row.contentsScale = NSScreen.mainScreen.backingScaleFactor;
     row.string = [[NSAttributedString alloc] initWithString:text attributes:attrs];
-    row.frame = frame;
-}
-
-static void NDApplyMediaCtrlStyle(CATextLayer *row, CGRect frame, BOOL sideButton) {
-    if (!row) return;
-    row.wrapped = NO;
-    row.truncationMode = kCATruncationEnd;
-    row.alignmentMode = kCAAlignmentCenter;
-    CGFloat size = sideButton ? kNDMediaCtrlSideFontSize : kNDMediaCtrlFontSize;
-    row.fontSize = size;
-    row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:size weight:NSFontWeightSemibold];
     row.frame = frame;
 }
 
@@ -1038,14 +1231,7 @@ static void NDLayoutMediaHorizontal(CALayer *shell, CGFloat topIn, CGFloat botIn
     CGRect artistClip = CGRectMake(textX, textAnchor - titleH - artistH, textW, artistH);
 
     CGFloat ctrlY = innerBot;
-    CGFloat btnW = textW / 3.0;
-    CGFloat ctrlFont = MAX(kNDMediaCtrlFontSize, kNDMediaCtrlSideFontSize);
-    NDApplyMediaHorizCtrlStyle(gNDMediaPrevLayer,
-                               CGRectMake(textX, ctrlY, btnW, ctrlH), ctrlFont);
-    NDApplyMediaHorizCtrlStyle(gNDMediaPlayLayer,
-                               CGRectMake(textX + btnW, ctrlY, btnW, ctrlH), ctrlFont);
-    NDApplyMediaHorizCtrlStyle(gNDMediaNextLayer,
-                               CGRectMake(textX + 2.0 * btnW, ctrlY, btnW, ctrlH), ctrlFont);
+    NDApplyHorizMediaControlFrames(textX, textW, ctrlY, ctrlH);
     NDMediaUpdateMarquee(titleClip, artistClip, NO);
 }
 
@@ -1145,11 +1331,68 @@ static void NDEnsureWidgets(void) {
 }
 
 static void NDLayoutWidgets(id dockBar);
-static void NDScheduleWidgetLayoutForce(id dockBar);
-static void NDScheduleWidgetRelayoutBurst(id dockBar);
-static void NDScheduleOrientationSettleRetry(id dockBar);
+
+static void NDScheduleOrientationSettleRetry(id dockBar) {
+    id bar = dockBar ?: gNDDockBar;
+    if (!bar) return;
+    uint64_t nonce = ++gNDSettleNonce;
+    const double delays[] = { 1.20, 2.00, 3.50, 5.00, 8.00, 10.00, 12.00, 13.50 };
+    for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
+        double sec = delays[i];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (nonce != gNDSettleNonce) return;
+            NDDeferLayoutUntilUnsuppressed(bar, ^(id dock) {
+                NDScheduleWidgetLayoutForce(dock);
+            });
+        });
+    }
+}
+
+static void NDScheduleWidgetRelayoutBurst(id dockBar) {
+    id bar = dockBar ?: gNDDockBar;
+    if (!bar) return;
+    uint64_t nonce = ++gNDRelayoutNonce;
+    NDScheduleWidgetLayoutForce(bar);
+    const double delays[] = { 0.05, 0.16, 0.32, 0.50, 0.80, 1.20 };
+    for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
+        double sec = delays[i];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (nonce != gNDRelayoutNonce) return;
+            NDDeferLayoutUntilUnsuppressed(bar, ^(id dock) {
+                NDScheduleWidgetLayoutForce(dock);
+            });
+        });
+    }
+}
+
+/// Coalesced: nếu đã có một lượt layout đang chờ trên runloop thì bỏ qua
+/// (gộp nhiều lời gọi cùng lúc → 1 layout, giảm tải khi animation gọi dồn dập).
+static void NDScheduleWidgetLayoutForce(id dockBar) {
+    id bar = dockBar ?: gNDDockBar;
+    if (!bar) return;
+    if (gNDWidgetLayoutPending) return;
+    gNDWidgetLayoutPending = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gNDWidgetLayoutPending = NO;
+        if (NDShouldSuppressWidgetLayout()) return;
+        if (gNDInWidgetLayout) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!NDShouldSuppressWidgetLayout())
+                    NDLayoutWidgets(bar);
+            });
+            return;
+        }
+        NDLayoutWidgets(bar);
+    });
+}
+
+static void NDStartReshowWatchdog(id dockBar);
 
 /// Ẩn probe khi layout bỏ qua — tránh widget kẹt frame cũ (đổi dọc↔ngang).
+/// Bật watchdog để bảo đảm re-show khi floor ổn định trở lại.
 static void NDHideProbeWidgets(void) {
     if (gNDProbeIcon) gNDProbeIcon.hidden = YES;
     if (gNDRightProbeIcon) gNDRightProbeIcon.hidden = YES;
@@ -1157,14 +1400,39 @@ static void NDHideProbeWidgets(void) {
     if (gNDProbeBgLayer) gNDProbeBgLayer.hidden = YES;
     if (gNDRightProbeBgLayer) gNDRightProbeBgLayer.hidden = YES;
     if (gNDMediaProbeBgLayer) gNDMediaProbeBgLayer.hidden = YES;
+    NDMediaControlsHide();
+    NDStartReshowWatchdog(gNDDockBar);
+}
+
+static void NDReshowWatchdogTick(id bar) {
+    if (!gNDNeedWidgetReshow) { gNDReshowWatchdogActive = NO; return; }
+    if (!NDShouldSuppressWidgetLayout() && !gNDInWidgetLayout)
+        NDLayoutWidgets(bar);
+    if (!gNDNeedWidgetReshow) { gNDReshowWatchdogActive = NO; return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NDReshowWatchdogTick(bar);
+    });
+}
+
+/// Level-triggered: đặt cờ cần re-show và chạy watchdog (một chuỗi duy nhất).
+/// Cờ được xoá tại điểm layout hoàn tất ("done") trong NDLayoutWidgets.
+static void NDStartReshowWatchdog(id dockBar) {
+    id bar = dockBar ?: gNDDockBar;
+    if (!bar) return;
+    gNDNeedWidgetReshow = YES;
+    if (gNDReshowWatchdogActive) return;
+    gNDReshowWatchdogActive = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NDReshowWatchdogTick(bar);
+    });
 }
 
 static void NDAbortWidgetLayout(id dockBar, BOOL hideProbes, const char *reason) {
-    (void)dockBar;
     (void)reason;
     if (hideProbes)
         NDHideProbeWidgets();
-    // Retry ngắn trong settle — KHÔNG reset gNDSettleNonce (tránh hủy retry 8–12s).
     if (NDInOrientationSettle()) {
         id bar = dockBar ?: gNDDockBar;
         if (bar) {
@@ -1205,63 +1473,28 @@ static void NDOnDockGeometryChange(id dockBar) {
     BOOL barChanged = NDNoteBarOrientationChange(dockBar);
     BOOL shapeChanged = NDNoteFloorShapeChange();
     if (!barChanged && !shapeChanged) return;
+    if (shapeChanged) {
+        NDInvalidateStableLayout("geometry");
+        NDHideProbeWidgets();
+    }
     NDBeginOrientationSettle();
     NDScheduleOrientationSettleRetry(dockBar);
     NDScheduleWidgetRelayoutBurst(dockBar);
 }
 
-static void NDScheduleOrientationSettleRetry(id dockBar) {
-    id bar = dockBar ?: gNDDockBar;
-    if (!bar) return;
-    uint64_t nonce = ++gNDSettleNonce;
-    const double delays[] = { 1.20, 2.00, 3.50, 5.00, 8.00, 10.00, 12.00, 13.50 };
-    for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
-        double sec = delays[i];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (nonce != gNDSettleNonce) return;
-            NDScheduleWidgetLayoutForce(bar);
-        });
-    }
-}
-
-static void NDScheduleWidgetRelayoutBurst(id dockBar) {
-    id bar = dockBar ?: gNDDockBar;
-    uint64_t nonce = ++gNDRelayoutNonce;
-    NDScheduleWidgetLayoutForce(bar);
-    const double delays[] = { 0.05, 0.16, 0.32, 0.50, 0.80, 1.20 };
-    for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
-        double sec = delays[i];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (nonce == gNDRelayoutNonce) NDScheduleWidgetLayoutForce(bar);
-        });
-    }
-}
-
-/// Bỏ qua pending — dùng khi settle/recovery sau đổi orientation.
-static void NDScheduleWidgetLayoutForce(id dockBar) {
-    id bar = dockBar ?: gNDDockBar;
-    if (!bar) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        gNDWidgetLayoutPending = NO;
-        if (gNDInWidgetLayout) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                gNDWidgetLayoutPending = NO;
-                NDLayoutWidgets(bar);
-            });
-            return;
-        }
-        NDLayoutWidgets(bar);
-    });
-}
-
 static void NDLayoutWidgets(id dockBar) {
     if (gNDInWidgetLayout) return;
+    if (NDShouldSuppressWidgetLayout()) return;
     if (!dockBar) dockBar = gNDDockBar;
 
     CALayer *floor = gNDFloorLayerRef;
+    // Tự sửa ref stale: floor hiện tại mất/host rỗng tile → tìm floor "sống".
+    if (!floor || !floor.superlayer
+        || NDCountDockTiles(floor.superlayer, floor) == 0) {
+        CALayer *better = NDRediscoverFloorLayer();
+        if (better)
+            gNDFloorLayerRef = floor = better;
+    }
     if (!floor || !floor.superlayer) {
         gNDFloorLayerRef = NULL;
         NDAbortWidgetLayout(dockBar, NO, "no_floor");
@@ -1280,6 +1513,7 @@ static void NDLayoutWidgets(id dockBar) {
         NDAbortWidgetLayout(dockBar, YES, "shape_mismatch");
         return;
     }
+    horizontal = NDLayoutHorizontal(dockBar, horizontal);
     if (!NDBandSpanReasonable(horizontal, floorW, floorH)) {
         NDAbortWidgetLayout(dockBar, NO, "band_span");
         return;
@@ -1308,6 +1542,7 @@ static void NDLayoutWidgets(id dockBar) {
         BOOL statsOverlap = NO, netOverlap = NO, mediaOverlap = NO;
         const char *floorRectSrc = "?";
         CGRect floorInHost = NDFloorRectForWidgets(floor, host, dockHorizontal, &floorRectSrc);
+        gNDLastFloorInHost = floorInHost;
         if (!NDFloorHostUsable(floorInHost, horizontal, floorW, floorH)) {
             gNDInWidgetLayout = NO;
             NDAbortWidgetLayout(dockBar, NO, "host_usable");
@@ -1321,6 +1556,9 @@ static void NDLayoutWidgets(id dockBar) {
             CALayer *srcRight = NDRightmostValidTile(host);
             if (!srcLeft) {
                 gNDInWidgetLayout = NO;
+                if (gNDDockBootTime > 0
+                    && CFAbsoluteTimeGetCurrent() - gNDDockBootTime < 8.0)
+                    return;
                 NDAbortWidgetLayout(dockBar, NO, "no_tile_h");
                 return;
             }
@@ -1353,9 +1591,24 @@ static void NDLayoutWidgets(id dockBar) {
                                       !statsOverlap, !netOverlap, !mediaOverlap, NO);
         } else {
             NDStatsSetVerticalCompact(YES);
+            if (NDShouldFreezeWidgetHosts(NO)) {
+                statsHost = gNDStableStatsHost;
+                netHost = gNDStableNetHost;
+                mediaHost = gNDStableMediaHost;
+                CALayer *src = NDEndmostValidTile(host, NO);
+                if (!src) src = NDLeftmostValidTile(host);
+                if (src) {
+                    NDSyncGlassWidgetsOnFloor(host, floor, src, src, src,
+                                              statsHost, netHost, mediaHost,
+                                              YES, YES, YES, YES);
+                }
+            } else {
             CALayer *src = NDEndmostValidTile(host, NO);
             if (!src) {
                 gNDInWidgetLayout = NO;
+                if (gNDDockBootTime > 0
+                    && CFAbsoluteTimeGetCurrent() - gNDDockBootTime < 8.0)
+                    return;
                 NDAbortWidgetLayout(dockBar, NO, "no_tile_v");
                 return;
             }
@@ -1403,6 +1656,7 @@ static void NDLayoutWidgets(id dockBar) {
             NDSyncGlassWidgetsOnFloor(host, floor, src, src, src,
                                       statsHost, netHost, mediaHost,
                                       !statsOverlap, !netOverlap, !mediaOverlap, YES);
+            }
         }
 
         {
@@ -1414,7 +1668,7 @@ static void NDLayoutWidgets(id dockBar) {
                 || statsHost.size.height < 1.0 || netHost.size.height < 1.0
                 || mediaHost.size.height < 1.0) {
                 gNDInWidgetLayout = NO;
-                NDAbortWidgetLayout(dockBar, NO, "bounds_overflow");
+                NDAbortWidgetLayout(dockBar, YES, "bounds_overflow");
                 return;
             }
         }
@@ -1433,39 +1687,63 @@ static void NDLayoutWidgets(id dockBar) {
         CGRect lp = gNDProbeIcon ? gNDProbeIcon.frame : CGRectZero;
         CGRect rp = gNDRightProbeIcon ? gNDRightProbeIcon.frame : CGRectZero;
         BOOL ghost = NDGhostRisk(horizontal, floorInHost, lp, rp);
-        if (ghost) {
+        if (ghost && !NDInOrientationSettle()) {
             NDHideProbeWidgets();
             gNDInWidgetLayout = NO;
             NDScheduleWidgetLayoutForce(dockBar);
             return;
         }
 
+        if (!mediaOverlap && !statsOverlap) {
+            gNDStableStatsHost = statsHost;
+            gNDStableNetHost = netHost;
+            gNDStableMediaHost = mediaHost;
+            gNDStableFloorScreen = gNDFloorFrame;
+            gNDStableCompactVertical = !horizontal;
+            gNDStableLayoutValid = YES;
+        } else if (!mediaOverlap) {
+            gNDStableMediaHost = mediaHost;
+            gNDStableStatsHost = statsHost;
+            gNDStableFloorScreen = gNDFloorFrame;
+            gNDStableCompactVertical = !horizontal;
+            gNDStableLayoutValid = YES;
+        }
+        gNDNeedWidgetReshow = NO;
+
         NDStatsTick();
+        NDUpdateMediaControlHitRects(host);
     } @catch (__unused NSException *e) {}
     gNDInWidgetLayout = NO;
 }
 
 static void nd_hook_setFloorFrame(id self, SEL _cmd, CGRect rect) {
     gNDDockBar = self;
+    NDMediaControlsInstall(self);
+    CGRect prevFloor = gNDFloorFrame;
     rect = NDResizeFloorFrame(rect);
     if (rect.size.width > kNDMinRealSpan || rect.size.height > kNDMinRealSpan) {
+        if (gNDFloorFrameValid && NDFloorScreenMoved(prevFloor, rect))
+            NDInvalidateStableLayout("floor_frame");
         gNDFloorFrame = rect;
         gNDFloorFrameValid = YES;
     }
     NDOnDockGeometryChange(self);
     orig_setFloorFrame(self, _cmd, rect);
     BOOL dockH = NDEffectiveDockHorizontal(self, gNDFloorLayerRef);
-    if (NDFloorShapeMatchesDock(dockH, rect.size.width, rect.size.height))
-        NDScheduleWidgetLayoutForce(self);
-    else
+    if (NDShouldSuppressWidgetLayout()) return;
+    if (NDFloorShapeMatchesDock(dockH, rect.size.width, rect.size.height)) {
+        if (!NDAnimLayoutThrottled())
+            NDScheduleWidgetLayoutForce(self);
+    } else {
         NDScheduleWidgetRelayoutBurst(self);
+    }
 }
 
 static void nd_hook_setFLastBarRect(id self, SEL _cmd, CGRect rect) {
     gNDDockBar = self;
     NDOnDockGeometryChange(self);
     orig_setFLastBarRect(self, _cmd, rect);
-    if (gNDFloorLayerRef)
+    if (gNDFloorLayerRef && !NDShouldSuppressWidgetLayout())
         NDScheduleWidgetRelayoutBurst(self);
 }
 
@@ -1475,10 +1753,16 @@ static void nd_floor_layoutSublayers(id self, SEL _cmd) {
     if (!NDIsMainFloorLayer(floor)) return;
 
     if (gNDFloorLayerRef != floor) {
+        // Chỉ nhận floor mới nếu host của nó thật sự có dock tile — tránh bám
+        // floor cũ đang teardown (host 0 tile) khi đổi dock in-process.
+        if (NDCountDockTiles(floor.superlayer, floor) == 0
+            && gNDFloorLayerRef && gNDFloorLayerRef.superlayer
+            && NDCountDockTiles(gNDFloorLayerRef.superlayer, gNDFloorLayerRef) > 0)
+            return;
         gNDFloorLayerRef = floor;
         NDScheduleWidgetRelayoutBurst(gNDDockBar);
-    } else if (!gNDInWidgetLayout) {
-        gNDFloorLayerRef = floor;
+    } else if (!gNDInWidgetLayout && !NDShouldSuppressWidgetLayout()) {
+        if (NDAnimLayoutThrottled()) return;
         NDLayoutWidgets(gNDDockBar);
     }
 }
@@ -1512,6 +1796,7 @@ static void NDInstallDockHooks(void) {
         }
     }
     NDInstallFloorHook();
+    NDMediaControlsInstall(bar);
 }
 
 static void nd_on_image_added(const struct mach_header *mh, intptr_t slide) {
@@ -1523,6 +1808,7 @@ static void nd_on_image_added(const struct mach_header *mh, intptr_t slide) {
 __attribute__((constructor(0)))
 static void nd_init(void) {
     if (NDIsDockProcess()) {
+        gNDDockBootTime = CFAbsoluteTimeGetCurrent();
         _dyld_register_func_for_add_image(nd_on_image_added);
         NDInstallDockHooks();
         return;
