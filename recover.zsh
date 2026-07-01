@@ -75,7 +75,6 @@ case "${1:-help}" in
     ;;
   install-verify)
     launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null
-    launchctl unsetenv NDOCK_DEBUG 2>/dev/null
     command bash "$NDOCK_ROOT/scripts/verify_dock.sh" --install
     ;;
   app)
