@@ -13,9 +13,9 @@ bootstrap:
 
 build: NDock.dylib
 
-NDock.dylib: Tweak.m WindowMargin.m NDConfig.m NDStats.m NDPerf.m
+NDock.dylib: Tweak.m WindowMargin.m NDConfig.m NDStats.m NDPerf.m NDMedia.m
 	$(UNINJECT) clang -dynamiclib -framework Cocoa -framework QuartzCore -framework IOKit \
-		-install_name "@rpath/NDock.dylib" -o $(OUT) Tweak.m WindowMargin.m NDConfig.m NDStats.m NDPerf.m $(CFLAGS)
+		-install_name "@rpath/NDock.dylib" -o $(OUT) Tweak.m WindowMargin.m NDConfig.m NDStats.m NDPerf.m NDMedia.m $(CFLAGS)
 	$(UNINJECT) codesign -f -s - --all-architectures $(OUT)
 	@echo "Built $(OUT)"
 

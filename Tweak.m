@@ -6,6 +6,7 @@
 #import <mach-o/dyld.h>
 #import "NDConfig.h"
 #import "NDStats.h"
+#import "NDMedia.h"
 #import <math.h>
 
 void NDWindowMarginInit(void);
@@ -23,6 +24,14 @@ static const CGFloat kNDWidgetCompactFontSize = 8.0;
 static const CGFloat kNDWidgetCompactPadPt = 5.0;
 static const int kNDStatsCompactLines = 8;
 static const int kNDNetCompactLines = 2;
+static const CGFloat kNDMediaHorizArtPt = 34.0;
+static const CGFloat kNDMediaHorizMinWidthPt = 118.0;
+static const CGFloat kNDMediaPadPt = 3.0;
+static const CGFloat kNDMediaCtrlFontSize = 11.0;
+static const CGFloat kNDMediaCtrlSideFontSize = 12.5;
+static const CGFloat kNDMediaCompactCtrlFontSize = 10.0;
+static const CGFloat kNDMediaCompactCtrlSideFontSize = 11.5;
+static const CGFloat kNDMediaArtistLineH = 9.0;
 static const CGFloat kNDWidgetMinHeightPt = 36.0;
 static const CGFloat kNDWidgetBgAlpha = 0.58;
 
@@ -34,6 +43,9 @@ static NSString * const kNDHorizChipReserveGHz = @"CPU 100.0GHz | GPU 100.0GHz";
 static NSString * const kNDHorizChipReserveMHz = @"CPU 999MHz | GPU 999MHz";
 static NSString * const kNDHorizNetUpReserve = @"↑ 9.999 KB/s";
 static NSString * const kNDHorizNetDownReserve = @"↓ 9.999 MB/s";
+static NSString * const kNDHorizMediaTitleReserve = @"Blinding Lights";
+static NSString * const kNDHorizMediaArtistReserve = @"The Weeknd";
+static NSString * const kNDHorizMediaControlsReserve = @"⏮   ▶   ⏭";
 static const CGFloat kNDHorizontalMeasureFudgePt = 10.0;
 
 typedef void (*set_rect_fn)(id, SEL, CGRect);
@@ -58,6 +70,16 @@ static BOOL gNDWidgetLayoutPending = NO;
 static CATextLayer *gNDDiskLayer = NULL;
 static CATextLayer *gNDRamLayer = NULL;
 static CATextLayer *gNDChipLayer = NULL;
+static CALayer *gNDMediaProbeIcon = NULL;
+static CALayer *gNDMediaProbeBgLayer = NULL;
+static CALayer *gNDMediaArtLayer = NULL;
+static CALayer *gNDMediaTitleClip = NULL;
+static CALayer *gNDMediaArtistClip = NULL;
+static CATextLayer *gNDMediaTitleLayer = NULL;
+static CATextLayer *gNDMediaArtistLayer = NULL;
+static CATextLayer *gNDMediaPrevLayer = NULL;
+static CATextLayer *gNDMediaPlayLayer = NULL;
+static CATextLayer *gNDMediaNextLayer = NULL;
 static CATextLayer *gNDNetUpLayer = NULL;
 static CATextLayer *gNDNetDownLayer = NULL;
 static BOOL gNDInWidgetLayout = NO;
@@ -173,12 +195,21 @@ static BOOL NDGhostRisk(BOOL layoutHorizontal, CGRect floorInHost,
     if (rightProbe.size.width > 1.0
         && rightProbe.size.height > rightProbe.size.width * 1.4)
         return YES;
+    if (gNDMediaProbeIcon && !gNDMediaProbeIcon.hidden) {
+        CGRect mp = gNDMediaProbeIcon.frame;
+        if (mp.size.width > 1.0 && mp.size.height > mp.size.width * 1.4)
+            return YES;
+    }
     return NO;
 }
 
 static void NDLayoutTextRows(CALayer *shell, CATextLayer *const *rows, int count);
 static void NDLayoutStatsCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR);
 static void NDLayoutNetCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR);
+static void NDLayoutMediaHorizontal(CALayer *shell, CGFloat topIn, CGFloat botIn);
+static void NDLayoutMediaCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR);
+static CGFloat NDHorizontalMediaContentWidth(void);
+static BOOL NDIsMediaShellLayer(CALayer *sub);
 static CGRect NDFloorRectForWidgets(CALayer *floor, CALayer *host, BOOL dockHorizontal,
                                     const char **outSource);
 static CGRect NDTileVisualRectInHost(CALayer *tile, CALayer *host);
@@ -223,12 +254,18 @@ static CGFloat NDVerticalCompactContentHeight(int lines) {
     return (CGFloat)lines * kNDWidgetCompactLineH + 2.0 * kNDWidgetCompactPadPt;
 }
 
+static CGFloat NDMediaVerticalContentHeight(void) {
+    CGFloat lineH = kNDWidgetCompactLineH;
+    CGFloat ctrlLineH = lineH + 1.0;
+    return 2.0 * lineH + 3.0 * ctrlLineH + 2.0 * kNDMediaPadPt;
+}
+
 static CALayer *NDEndmostValidTile(CALayer *host, BOOL topEnd) {
     if (!host) return NULL;
     CALayer *best = NULL;
     CGFloat bestY = topEnd ? CGFLOAT_MAX : -CGFLOAT_MAX;
     for (CALayer *s in host.sublayers) {
-        if (s == gNDProbeIcon || s == gNDRightProbeIcon
+        if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
             || s == gNDLeftShell || s == gNDRightShell) continue;
         if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
         CGRect f = s.frame;
@@ -244,12 +281,31 @@ static CALayer *NDEndmostValidTile(CALayer *host, BOOL topEnd) {
     return best;
 }
 
+static CALayer *NDRightmostValidTile(CALayer *host) {
+    if (!host) return NULL;
+    CALayer *best = NULL;
+    CGFloat bestX = -CGFLOAT_MAX;
+    for (CALayer *s in host.sublayers) {
+        if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
+            || s == gNDLeftShell || s == gNDRightShell) continue;
+        if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
+        CGRect f = s.frame;
+        if (f.size.width < 8.0 || f.size.height < 8.0) continue;
+        if (f.size.height > 256.0 || f.size.width > 256.0) continue;
+        if (CGRectGetMaxX(f) > bestX) {
+            bestX = CGRectGetMaxX(f);
+            best = s;
+        }
+    }
+    return best;
+}
+
 static CALayer *NDLeftmostValidTile(CALayer *host) {
     if (!host) return NULL;
     CALayer *best = NULL;
     CGFloat bestX = CGFLOAT_MAX;
     for (CALayer *s in host.sublayers) {
-        if (s == gNDProbeIcon || s == gNDRightProbeIcon
+        if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
             || s == gNDLeftShell || s == gNDRightShell) continue;
         if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
         CGRect f = s.frame;
@@ -269,7 +325,7 @@ static BOOL NDIconClusterX(CALayer *host, CGFloat *outMinX, CGFloat *outMaxX) {
     CGFloat minX = CGFLOAT_MAX, maxX = -CGFLOAT_MAX;
     int n = 0;
     for (CALayer *s in host.sublayers) {
-        if (s == gNDProbeIcon || s == gNDRightProbeIcon
+        if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
             || s == gNDLeftShell || s == gNDRightShell) continue;
         if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
         CGRect f = s.frame;
@@ -290,7 +346,7 @@ static BOOL NDIconClusterY(CALayer *host, CGFloat *outMinY, CGFloat *outMaxY) {
     CGFloat minY = CGFLOAT_MAX, maxY = -CGFLOAT_MAX;
     int n = 0;
     for (CALayer *s in host.sublayers) {
-        if (s == gNDProbeIcon || s == gNDRightProbeIcon
+        if (s == gNDProbeIcon || s == gNDRightProbeIcon || s == gNDMediaProbeIcon
             || s == gNDLeftShell || s == gNDRightShell) continue;
         if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
         CGRect f = s.frame;
@@ -329,7 +385,13 @@ static void NDApplyLiquidGlass(CALayer *layer) {
 }
 
 static BOOL NDIsGlassWidgetBg(CALayer *sub) {
-    return sub == gNDProbeBgLayer || sub == gNDRightProbeBgLayer;
+    return sub == gNDProbeBgLayer || sub == gNDRightProbeBgLayer
+        || sub == gNDMediaProbeBgLayer;
+}
+
+static BOOL NDIsMediaShellLayer(CALayer *sub) {
+    return sub == gNDMediaArtLayer || sub == gNDMediaTitleClip || sub == gNDMediaArtistClip
+        || sub == gNDMediaPrevLayer || sub == gNDMediaPlayLayer || sub == gNDMediaNextLayer;
 }
 
 static void NDEnsureGlassWidgetHost(CALayer *shell, CALayer *host, CALayer *floor, CGFloat zBump) {
@@ -365,6 +427,16 @@ static void NDEnsureRightProbeIcon(CALayer *host, CALayer *floor) {
         gNDRightProbeIcon.backgroundColor = [[NSColor clearColor] CGColor];
     }
     NDEnsureGlassWidgetHost(gNDRightProbeIcon, host, floor, 551.0);
+}
+
+static void NDEnsureMediaProbeIcon(CALayer *host, CALayer *floor) {
+    if (!host || !floor) return;
+    if (!gNDMediaProbeIcon) {
+        gNDMediaProbeIcon = [CALayer layer];
+        gNDMediaProbeIcon.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+        gNDMediaProbeIcon.backgroundColor = [[NSColor clearColor] CGColor];
+    }
+    NDEnsureGlassWidgetHost(gNDMediaProbeIcon, host, floor, 552.0);
 }
 
 static void NDHideLegacyShells(void) {
@@ -483,13 +555,107 @@ static void NDSyncRightGlassWidget(CALayer *src, CGRect frame, BOOL compactVerti
     NDSyncGlassWidget(gNDRightProbeIcon, gNDRightProbeBgLayer, src, frame, rows, 2, compactVertical);
 }
 
+static void NDSyncMediaWidget(CALayer *shell, CALayer *bg, CALayer *src, CGRect frame,
+                              BOOL compactVertical) {
+    if (!shell || !src || !bg) return;
+    CALayer *host = src.superlayer;
+    CGRect vf = NDTileVisualRectInHost(src, host);
+    CGRect tf = src.frame;
+    CGFloat topIn = MAX(0.0, vf.origin.y - tf.origin.y);
+    CGFloat botIn = MAX(0.0, CGRectGetMaxY(tf) - CGRectGetMaxY(vf));
+    CGFloat leftIn = MAX(0.0, vf.origin.x - tf.origin.x);
+    CGFloat rightIn = MAX(0.0, CGRectGetMaxX(tf) - CGRectGetMaxX(vf));
+    CGFloat glassSideL = leftIn;
+    CGFloat glassSideR = rightIn;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    shell.geometryFlipped = NO;
+    shell.contents = nil;
+    shell.backgroundColor = [[NSColor clearColor] CGColor];
+    shell.borderWidth = 0.0;
+    for (CALayer *sub in [shell.sublayers copy]) {
+        if (NDIsGlassWidgetBg(sub) || NDIsMediaShellLayer(sub)) continue;
+        [sub removeFromSuperlayer];
+    }
+    shell.frame = frame;
+    shell.masksToBounds = NO;
+    shell.cornerRadius = 0.0;
+    shell.opacity = 1.0f;
+    shell.hidden = NO;
+
+    if (compactVertical) {
+        CGFloat bgW = MAX(8.0, frame.size.width - leftIn - rightIn);
+        CGFloat halfPad = (leftIn + rightIn) * 0.5;
+        CGFloat symL = (frame.size.width - bgW) * 0.5;
+        symL += NDVerticalGlassOuterSign(gNDDockBar, src) * halfPad;
+        symL = MAX(0.0, MIN(frame.size.width - bgW, symL));
+        glassSideL = symL;
+        glassSideR = frame.size.width - bgW - symL;
+        bg.frame = CGRectMake(symL, 0.0, bgW, frame.size.height);
+        bg.cornerRadius = (src.cornerRadius > 0.5) ? src.cornerRadius : bgW * 0.22;
+    } else {
+        CGFloat bgH = MAX(8.0, frame.size.height - topIn - botIn);
+        bg.frame = CGRectMake(0.0, topIn, frame.size.width, bgH);
+        bg.cornerRadius = (src.cornerRadius > 0.5) ? src.cornerRadius : bgH * 0.22;
+    }
+    bg.masksToBounds = YES;
+    if (bg.superlayer != shell)
+        [shell insertSublayer:bg atIndex:0];
+    NDApplyLiquidGlass(bg);
+    bg.zPosition = 0.0;
+
+    CALayer *art = gNDMediaArtLayer;
+    CALayer *clips[] = { gNDMediaTitleClip, gNDMediaArtistClip };
+    CATextLayer *btns[] = { gNDMediaPrevLayer, gNDMediaPlayLayer, gNDMediaNextLayer };
+    if (art) {
+        if (art.superlayer != shell) [shell addSublayer:art];
+        art.hidden = compactVertical;
+        art.opacity = 1.0f;
+        art.zPosition = 2.0;
+        art.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    }
+    for (size_t i = 0; i < sizeof(clips) / sizeof(clips[0]); i++) {
+        CALayer *clip = clips[i];
+        if (!clip) continue;
+        if (clip.superlayer != shell) [shell addSublayer:clip];
+        clip.hidden = NO;
+        clip.opacity = 1.0f;
+        clip.zPosition = 2.0;
+        clip.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    }
+    for (size_t i = 0; i < sizeof(btns) / sizeof(btns[0]); i++) {
+        CATextLayer *row = btns[i];
+        if (!row) continue;
+        if (row.superlayer != shell) [shell addSublayer:row];
+        row.hidden = NO;
+        row.opacity = 1.0f;
+        row.zPosition = 2.0;
+        row.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    }
+    [CATransaction commit];
+
+    if (compactVertical)
+        NDLayoutMediaCompact(shell, glassSideL, glassSideR);
+    else
+        NDLayoutMediaHorizontal(shell, topIn, botIn);
+    NDMediaRelayout();
+}
+
+static void NDSyncMediaIcon(CALayer *src, CGRect frame, BOOL compactVertical) {
+    if (!gNDMediaProbeIcon || !src) return;
+    gNDMediaProbeBgLayer = NDEnsureGlassBgLayer(gNDMediaProbeIcon, gNDMediaProbeBgLayer);
+    NDSyncMediaWidget(gNDMediaProbeIcon, gNDMediaProbeBgLayer, src, frame, compactVertical);
+}
+
 static void NDSyncGlassWidgetsOnFloor(CALayer *host, CALayer *floor,
-                                      CALayer *srcStats, CALayer *srcNet,
-                                      CGRect statsFrame, CGRect netFrame,
-                                      BOOL showStats, BOOL showNet,
+                                      CALayer *srcStats, CALayer *srcNet, CALayer *srcMedia,
+                                      CGRect statsFrame, CGRect netFrame, CGRect mediaFrame,
+                                      BOOL showStats, BOOL showNet, BOOL showMedia,
                                       BOOL compactVertical) {
     NDEnsureProbeIcon(host, floor);
     NDEnsureRightProbeIcon(host, floor);
+    NDEnsureMediaProbeIcon(host, floor);
     if (showStats)
         NDSyncProbeIcon(srcStats, statsFrame, compactVertical);
     else if (gNDProbeIcon)
@@ -498,8 +664,13 @@ static void NDSyncGlassWidgetsOnFloor(CALayer *host, CALayer *floor,
         NDSyncRightGlassWidget(srcNet, netFrame, compactVertical);
     else if (gNDRightProbeIcon)
         gNDRightProbeIcon.hidden = YES;
+    if (showMedia)
+        NDSyncMediaIcon(srcMedia, mediaFrame, compactVertical);
+    else if (gNDMediaProbeIcon)
+        gNDMediaProbeIcon.hidden = YES;
     if (gNDProbeBgLayer) gNDProbeBgLayer.hidden = !showStats;
     if (gNDRightProbeBgLayer) gNDRightProbeBgLayer.hidden = !showNet;
+    if (gNDMediaProbeBgLayer) gNDMediaProbeBgLayer.hidden = !showMedia;
     NDHideLegacyShells();
     gNDWidgetsAttached = YES;
 }
@@ -757,6 +928,166 @@ static void NDLayoutNetCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR)
     }
 }
 
+static void NDApplyMediaTextStyle(CATextLayer *row, CGRect frame, BOOL centered) {
+    if (!row) return;
+    row.wrapped = NO;
+    row.truncationMode = kCATruncationEnd;
+    row.alignmentMode = centered ? kCAAlignmentCenter : kCAAlignmentLeft;
+    row.fontSize = kNDWidgetFontSize;
+    row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDWidgetFontSize
+                                                       weight:NSFontWeightSemibold];
+    row.frame = frame;
+}
+
+static void NDApplyMediaCompactStyle(CATextLayer *row, CGRect frame, BOOL centered) {
+    if (!row) return;
+    row.wrapped = NO;
+    row.truncationMode = kCATruncationEnd;
+    row.alignmentMode = centered ? kCAAlignmentCenter : kCAAlignmentLeft;
+    row.fontSize = kNDWidgetCompactFontSize;
+    row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDWidgetCompactFontSize
+                                                       weight:NSFontWeightSemibold];
+    row.frame = frame;
+}
+
+static void NDApplyMediaHorizCtrlStyle(CATextLayer *row, CGRect frame, CGFloat fontSize) {
+    if (!row) return;
+    NSString *text = nil;
+    id cur = row.string;
+    if ([cur isKindOfClass:[NSString class]]) text = (NSString *)cur;
+    else if ([cur isKindOfClass:[NSAttributedString class]]) text = [(NSAttributedString *)cur string];
+    if (!text.length) return;
+
+    NSFont *font = [NSFont systemFontOfSize:fontSize weight:NSFontWeightSemibold];
+    CGFloat lineH = frame.size.height;
+    NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+    ps.alignment = NSTextAlignmentCenter;
+    ps.minimumLineHeight = lineH;
+    ps.maximumLineHeight = lineH;
+
+    CGFloat fontH = font.ascender - font.descender + font.leading;
+    CGFloat baselineOffset = floor((lineH - fontH) * 0.5);
+    NSMutableDictionary *attrs = [@{
+        NSFontAttributeName: font,
+        NSParagraphStyleAttributeName: ps,
+        NSBaselineOffsetAttributeName: @(baselineOffset),
+    } mutableCopy];
+    if (row.foregroundColor)
+        attrs[NSForegroundColorAttributeName] = [NSColor colorWithCGColor:row.foregroundColor];
+
+    row.wrapped = NO;
+    row.truncationMode = kCATruncationEnd;
+    row.alignmentMode = kCAAlignmentCenter;
+    row.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    row.string = [[NSAttributedString alloc] initWithString:text attributes:attrs];
+    row.frame = frame;
+}
+
+static void NDApplyMediaCtrlStyle(CATextLayer *row, CGRect frame, BOOL sideButton) {
+    if (!row) return;
+    row.wrapped = NO;
+    row.truncationMode = kCATruncationEnd;
+    row.alignmentMode = kCAAlignmentCenter;
+    CGFloat size = sideButton ? kNDMediaCtrlSideFontSize : kNDMediaCtrlFontSize;
+    row.fontSize = size;
+    row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:size weight:NSFontWeightSemibold];
+    row.frame = frame;
+}
+
+static void NDApplyMediaCompactCtrlStyle(CATextLayer *row, CGRect frame, BOOL sideButton) {
+    if (!row) return;
+    row.wrapped = NO;
+    row.truncationMode = kCATruncationEnd;
+    row.alignmentMode = kCAAlignmentCenter;
+    CGFloat size = sideButton ? kNDMediaCompactCtrlSideFontSize : kNDMediaCompactCtrlFontSize;
+    row.fontSize = size;
+    row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:size weight:NSFontWeightSemibold];
+    row.frame = frame;
+}
+
+static void NDLayoutMediaHorizontal(CALayer *shell, CGFloat topIn, CGFloat botIn) {
+    if (!shell || !gNDMediaArtLayer || !gNDMediaTitleLayer) return;
+    CGFloat w = shell.bounds.size.width;
+    CGFloat h = shell.bounds.size.height;
+    if (w < 1.0 || h < 1.0) return;
+
+    CGFloat glassH = MAX(8.0, h - topIn - botIn);
+    CGFloat innerW = MAX(1.0, w - 2.0 * kNDMediaPadPt);
+    CGFloat innerH = MAX(8.0, glassH - 2.0 * kNDMediaPadPt);
+    (void)innerW;
+    CGFloat innerBot = topIn + kNDMediaPadPt;
+    CGFloat innerTop = topIn + glassH - kNDMediaPadPt;
+
+    CGFloat artSz = MIN(kNDMediaHorizArtPt, innerH);
+    artSz = MAX(20.0, artSz);
+    CGFloat artX = kNDMediaPadPt;
+    CGFloat artY = innerBot + (innerH - artSz) * 0.5;
+    gNDMediaArtLayer.frame = CGRectMake(artX, artY, artSz, artSz);
+    gNDMediaArtLayer.cornerRadius = artSz * 0.12 + 2.0;
+
+    CGFloat textX = artX + artSz + kNDMediaPadPt;
+    CGFloat textW = MAX(1.0, w - textX - kNDMediaPadPt);
+    CGFloat ctrlH = ceil(MAX(kNDMediaCtrlSideFontSize, kNDMediaCtrlFontSize)) + 3.0;
+    CGFloat titleH = kNDWidgetLineH;
+    CGFloat artistH = kNDMediaArtistLineH;
+    CGFloat textBlockH = titleH + artistH;
+    CGFloat freeH = innerH - textBlockH - ctrlH;
+    CGFloat textAnchor = innerTop - MAX(0.0, freeH * 0.35);
+
+    CGRect titleClip = CGRectMake(textX, textAnchor - titleH, textW, titleH);
+    CGRect artistClip = CGRectMake(textX, textAnchor - titleH - artistH, textW, artistH);
+
+    CGFloat ctrlY = innerBot;
+    CGFloat btnW = textW / 3.0;
+    CGFloat ctrlFont = MAX(kNDMediaCtrlFontSize, kNDMediaCtrlSideFontSize);
+    NDApplyMediaHorizCtrlStyle(gNDMediaPrevLayer,
+                               CGRectMake(textX, ctrlY, btnW, ctrlH), ctrlFont);
+    NDApplyMediaHorizCtrlStyle(gNDMediaPlayLayer,
+                               CGRectMake(textX + btnW, ctrlY, btnW, ctrlH), ctrlFont);
+    NDApplyMediaHorizCtrlStyle(gNDMediaNextLayer,
+                               CGRectMake(textX + 2.0 * btnW, ctrlY, btnW, ctrlH), ctrlFont);
+    NDMediaUpdateMarquee(titleClip, artistClip, NO);
+}
+
+static void NDLayoutMediaCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR) {
+    if (!shell || !gNDMediaTitleLayer) return;
+    CGFloat w = shell.bounds.size.width;
+    CGFloat h = shell.bounds.size.height;
+    if (w < 1.0 || h < 1.0) return;
+
+    CGFloat textX = sideInL + kNDMediaPadPt;
+    CGFloat textW = MAX(1.0, w - sideInL - sideInR - 2.0 * kNDMediaPadPt);
+    CGFloat titleLineH = kNDWidgetCompactLineH;
+    CGFloat artistLineH = kNDWidgetCompactLineH - 1.0;
+    CGFloat ctrlLineH = kNDWidgetCompactLineH + 1.0;
+    CGFloat yTop = h - kNDMediaPadPt;
+
+    yTop -= titleLineH;
+    CGRect titleClip = CGRectMake(textX, yTop, textW, titleLineH);
+    yTop -= artistLineH;
+    CGRect artistClip = CGRectMake(textX, yTop, textW, artistLineH);
+    yTop -= ctrlLineH;
+    NDApplyMediaCompactCtrlStyle(gNDMediaPrevLayer,
+                                 CGRectMake(textX, yTop, textW, ctrlLineH), YES);
+    yTop -= ctrlLineH;
+    NDApplyMediaCompactCtrlStyle(gNDMediaPlayLayer,
+                                 CGRectMake(textX, yTop, textW, ctrlLineH), NO);
+    yTop -= ctrlLineH;
+    NDApplyMediaCompactCtrlStyle(gNDMediaNextLayer,
+                                 CGRectMake(textX, yTop, textW, ctrlLineH), YES);
+    NDMediaUpdateMarquee(titleClip, artistClip, YES);
+}
+
+static CGFloat NDHorizontalMediaContentWidth(void) {
+    CGFloat titleW = NDHorizontalMeasureString(kNDHorizMediaTitleReserve);
+    CGFloat artistW = NDHorizontalMeasureString(kNDHorizMediaArtistReserve);
+    CGFloat ctrlW = NDHorizontalMeasureString(kNDHorizMediaControlsReserve);
+    CGFloat textW = MAX(titleW, MAX(artistW, ctrlW));
+    CGFloat w = kNDMediaHorizArtPt + kNDMediaPadPt + textW + 2.0 * kNDMediaPadPt
+              + kNDHorizontalMeasureFudgePt;
+    return MAX(kNDMediaHorizMinWidthPt, w);
+}
+
 static CALayer *NDMakeLayerShell(void) {
     CALayer *shell = [CALayer layer];
     shell.contentsScale = NSScreen.mainScreen.backingScaleFactor;
@@ -789,7 +1120,27 @@ static void NDEnsureWidgets(void) {
     [gNDRightShell addSublayer:gNDNetUpLayer];
     [gNDRightShell addSublayer:gNDNetDownLayer];
 
+    gNDMediaArtLayer = [CALayer layer];
+    gNDMediaArtLayer.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    gNDMediaTitleClip = [CALayer layer];
+    gNDMediaArtistClip = [CALayer layer];
+    gNDMediaTitleClip.masksToBounds = YES;
+    gNDMediaArtistClip.masksToBounds = YES;
+    gNDMediaTitleClip.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    gNDMediaArtistClip.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    gNDMediaTitleLayer = NDMakeText(@"Title …", hi);
+    gNDMediaArtistLayer = NDMakeText(@"Artist …", lo);
+    [gNDMediaTitleClip addSublayer:gNDMediaTitleLayer];
+    [gNDMediaArtistClip addSublayer:gNDMediaArtistLayer];
+    gNDMediaPrevLayer = NDMakeText(@"⏮", lo);
+    gNDMediaPlayLayer = NDMakeText(@"▶", hi);
+    gNDMediaNextLayer = NDMakeText(@"⏭", lo);
+
     NDStatsBindLayers(gNDDiskLayer, gNDRamLayer, gNDChipLayer, gNDNetUpLayer, gNDNetDownLayer);
+    NDMediaBindLayers(gNDMediaArtLayer, gNDMediaTitleClip, gNDMediaTitleLayer,
+                      gNDMediaArtistClip, gNDMediaArtistLayer,
+                      gNDMediaPrevLayer, gNDMediaPlayLayer, gNDMediaNextLayer);
+    NDMediaStart();
     NDStatsStart();
 }
 
@@ -802,8 +1153,10 @@ static void NDScheduleOrientationSettleRetry(id dockBar);
 static void NDHideProbeWidgets(void) {
     if (gNDProbeIcon) gNDProbeIcon.hidden = YES;
     if (gNDRightProbeIcon) gNDRightProbeIcon.hidden = YES;
+    if (gNDMediaProbeIcon) gNDMediaProbeIcon.hidden = YES;
     if (gNDProbeBgLayer) gNDProbeBgLayer.hidden = YES;
     if (gNDRightProbeBgLayer) gNDRightProbeBgLayer.hidden = YES;
+    if (gNDMediaProbeBgLayer) gNDMediaProbeBgLayer.hidden = YES;
 }
 
 static void NDAbortWidgetLayout(id dockBar, BOOL hideProbes, const char *reason) {
@@ -951,8 +1304,8 @@ static void NDLayoutWidgets(id dockBar) {
             return;
         }
 
-        CGRect leftHost = CGRectZero, rightHost = CGRectZero;
-        BOOL leftOverlap = NO, rightOverlap = NO;
+        CGRect statsHost = CGRectZero, netHost = CGRectZero, mediaHost = CGRectZero;
+        BOOL statsOverlap = NO, netOverlap = NO, mediaOverlap = NO;
         const char *floorRectSrc = "?";
         CGRect floorInHost = NDFloorRectForWidgets(floor, host, dockHorizontal, &floorRectSrc);
         if (!NDFloorHostUsable(floorInHost, horizontal, floorW, floorH)) {
@@ -964,32 +1317,40 @@ static void NDLayoutWidgets(id dockBar) {
         if (horizontal) {
             NDStatsSetVerticalCompact(NO);
             NDStatsTick();
-            CALayer *src = NDLeftmostValidTile(host);
-            if (!src) {
+            CALayer *srcLeft = NDLeftmostValidTile(host);
+            CALayer *srcRight = NDRightmostValidTile(host);
+            if (!srcLeft) {
                 gNDInWidgetLayout = NO;
                 NDAbortWidgetLayout(dockBar, NO, "no_tile_h");
                 return;
             }
-            CGRect sf = src.frame;
+            if (!srcRight) srcRight = srcLeft;
+            CGRect sf = srcLeft.frame;
 
             CATextLayer *statsRows[] = { gNDDiskLayer, gNDRamLayer, gNDChipLayer };
             CATextLayer *netRows[] = { gNDNetUpLayer, gNDNetDownLayer };
             NSString *statsReserve[] = { kNDHorizDiskReserve, kNDHorizRamReserve, kNDHorizChipReserveGHz };
             NSString *statsExtra[] = { kNDHorizChipReserveMHz };
             NSString *netReserve[] = { kNDHorizNetUpReserve, kNDHorizNetDownReserve };
-            CGFloat probeW = NDHorizontalContentWidth(statsRows, 3, statsReserve, 3, statsExtra, 1);
-            CGFloat rightW = NDHorizontalContentWidth(netRows, 2, netReserve, 2, NULL, 0);
-            CGFloat leftX = CGRectGetMinX(floorInHost) + insetX;
-            leftHost = NDHorizontalWidgetFrame(floor, host, floorInHost, src, leftX, probeW);
-            CGFloat rightX = CGRectGetMaxX(floorInHost) - insetX - rightW;
-            rightHost = NDHorizontalWidgetFrame(floor, host, floorInHost, src, rightX, rightW);
+            CGFloat statsW = NDHorizontalContentWidth(statsRows, 3, statsReserve, 3, statsExtra, 1);
+            CGFloat netW = NDHorizontalContentWidth(netRows, 2, netReserve, 2, NULL, 0);
+            CGFloat mediaW = NDHorizontalMediaContentWidth();
+
+            CGFloat statsX = CGRectGetMinX(floorInHost) + insetX;
+            statsHost = NDHorizontalWidgetFrame(floor, host, floorInHost, srcLeft, statsX, statsW);
+            CGFloat netX = CGRectGetMaxX(statsHost) + kNDWidgetIconGapPt;
+            netHost = NDHorizontalWidgetFrame(floor, host, floorInHost, srcLeft, netX, netW);
+            CGFloat mediaX = CGRectGetMaxX(floorInHost) - insetX - mediaW;
+            mediaHost = NDHorizontalWidgetFrame(floor, host, floorInHost, srcRight, mediaX, mediaW);
 
             CGFloat clusterMinX = sf.origin.x, clusterMaxX = CGRectGetMaxX(sf);
             NDIconClusterX(host, &clusterMinX, &clusterMaxX);
-            leftOverlap = CGRectGetMaxX(leftHost) + kNDWidgetIconGapPt > clusterMinX;
-            rightOverlap = CGRectGetMinX(rightHost) - kNDWidgetIconGapPt < clusterMaxX;
-            NDSyncGlassWidgetsOnFloor(host, floor, src, src, leftHost, rightHost,
-                                      !leftOverlap, !rightOverlap, NO);
+            statsOverlap = CGRectGetMaxX(statsHost) + kNDWidgetIconGapPt > clusterMinX;
+            netOverlap = CGRectGetMaxX(netHost) + kNDWidgetIconGapPt > clusterMinX;
+            mediaOverlap = CGRectGetMinX(mediaHost) - kNDWidgetIconGapPt < clusterMaxX;
+            NDSyncGlassWidgetsOnFloor(host, floor, srcLeft, srcLeft, srcRight,
+                                      statsHost, netHost, mediaHost,
+                                      !statsOverlap, !netOverlap, !mediaOverlap, NO);
         } else {
             NDStatsSetVerticalCompact(YES);
             CALayer *src = NDEndmostValidTile(host, NO);
@@ -1010,50 +1371,64 @@ static void NDLayoutWidgets(id dockBar) {
 
             CGFloat wantStatsH = NDVerticalCompactContentHeight(kNDStatsCompactLines);
             CGFloat wantNetH = NDVerticalCompactContentHeight(kNDNetCompactLines);
-            CGFloat maxStatsH = floorBot - clusterMaxY - kNDWidgetIconGapPt;
-            CGFloat maxNetH = clusterMinY - floorTop - kNDWidgetIconGapPt;
-            CGFloat statsH = MIN(wantStatsH, MAX(0.0, maxStatsH));
-            CGFloat netH = MIN(wantNetH, MAX(0.0, maxNetH));
-
-            CGFloat bottomY = floorBot - statsH;
-            CGFloat topY = floorTop;
-            leftHost = NDVerticalWidgetFrame(src, bottomY, statsH);
-            rightHost = NDVerticalWidgetFrame(src, topY, netH);
-
+            CGFloat wantMediaH = NDMediaVerticalContentHeight();
             CGFloat minStatsH = NDVerticalCompactContentHeight(kNDStatsCompactLines);
             CGFloat minNetH = NDVerticalCompactContentHeight(kNDNetCompactLines);
-            leftOverlap = statsH < minStatsH
-                       || NDRectsOverlapY(leftHost,
-                            CGRectMake(leftHost.origin.x, clusterMinY,
-                                       leftHost.size.width, clusterMaxY - clusterMinY),
-                            kNDWidgetIconGapPt);
-            rightOverlap = netH < minNetH
-                        || NDRectsOverlapY(rightHost,
-                             CGRectMake(rightHost.origin.x, clusterMinY,
-                                        rightHost.size.width, clusterMaxY - clusterMinY),
-                             kNDWidgetIconGapPt);
-            NDSyncGlassWidgetsOnFloor(host, floor, src, src, leftHost, rightHost,
-                                      !leftOverlap, !rightOverlap, YES);
+            CGFloat minMediaH = NDMediaVerticalContentHeight();
+
+            CGFloat topBand = floorBot - clusterMaxY - kNDWidgetIconGapPt;
+            CGFloat bottomBand = clusterMinY - floorTop - kNDWidgetIconGapPt;
+
+            CGFloat statsH = MIN(wantStatsH, MAX(0.0, topBand));
+            CGFloat statsY = floorBot - statsH;
+            statsHost = NDVerticalWidgetFrame(src, statsY, statsH);
+
+            CGFloat netAvail = topBand - statsH - kNDWidgetIconGapPt;
+            CGFloat netH = MIN(wantNetH, MAX(0.0, netAvail));
+            CGFloat netY = CGRectGetMinY(statsHost) - kNDWidgetIconGapPt - netH;
+            netHost = NDVerticalWidgetFrame(src, netY, netH);
+
+            CGFloat mediaH = MIN(wantMediaH, MAX(0.0, bottomBand));
+            mediaHost = NDVerticalWidgetFrame(src, floorTop, mediaH);
+
+            CGRect clusterBand = CGRectMake(statsHost.origin.x, clusterMinY,
+                                          statsHost.size.width,
+                                          clusterMaxY - clusterMinY);
+            statsOverlap = statsH < minStatsH
+                        || NDRectsOverlapY(statsHost, clusterBand, kNDWidgetIconGapPt);
+            netOverlap = netH < minNetH
+                      || NDRectsOverlapY(netHost, clusterBand, kNDWidgetIconGapPt);
+            mediaOverlap = mediaH < minMediaH
+                        || NDRectsOverlapY(mediaHost, clusterBand, kNDWidgetIconGapPt);
+            NDSyncGlassWidgetsOnFloor(host, floor, src, src, src,
+                                      statsHost, netHost, mediaHost,
+                                      !statsOverlap, !netOverlap, !mediaOverlap, YES);
         }
 
         {
             CGFloat floorMinY = CGRectGetMinY(floorInHost);
             CGFloat floorMaxY = CGRectGetMaxY(floorInHost);
-            if (CGRectGetMaxY(leftHost) > floorMaxY + 2.0
-                || CGRectGetMinY(rightHost) < floorMinY - 2.0
-                || leftHost.size.height < 1.0 || rightHost.size.height < 1.0) {
+            if (CGRectGetMaxY(statsHost) > floorMaxY + 2.0
+                || CGRectGetMinY(netHost) < floorMinY - 2.0
+                || CGRectGetMinY(mediaHost) < floorMinY - 2.0
+                || statsHost.size.height < 1.0 || netHost.size.height < 1.0
+                || mediaHost.size.height < 1.0) {
                 gNDInWidgetLayout = NO;
                 NDAbortWidgetLayout(dockBar, NO, "bounds_overflow");
                 return;
             }
         }
 
-        gNDProbeIcon.hidden = leftOverlap;
+        gNDProbeIcon.hidden = statsOverlap;
         if (gNDRightProbeIcon) {
-            gNDRightProbeIcon.hidden = rightOverlap;
-            if (!rightOverlap) gNDRightProbeIcon.opacity = 1.0f;
+            gNDRightProbeIcon.hidden = netOverlap;
+            if (!netOverlap) gNDRightProbeIcon.opacity = 1.0f;
         }
-        if (!leftOverlap) gNDProbeIcon.opacity = 1.0f;
+        if (gNDMediaProbeIcon) {
+            gNDMediaProbeIcon.hidden = mediaOverlap;
+            if (!mediaOverlap) gNDMediaProbeIcon.opacity = 1.0f;
+        }
+        if (!statsOverlap) gNDProbeIcon.opacity = 1.0f;
 
         CGRect lp = gNDProbeIcon ? gNDProbeIcon.frame : CGRectZero;
         CGRect rp = gNDRightProbeIcon ? gNDRightProbeIcon.frame : CGRectZero;
