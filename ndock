@@ -26,7 +26,7 @@ DOCK_BIN="/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
 GUI_DOMAIN="gui/$(id -u)"
 
 nd_stub_valid() {
-  [ -f "$1" ] && codesign -f -s - "$1" >/dev/null 2>&1
+  [ -f "$1" ] && codesign -f -s - --all-architectures "$1" >/dev/null 2>&1
 }
 
 nd_copy_stub() {
@@ -35,7 +35,7 @@ nd_copy_stub() {
   if nd_stub_valid "$stub"; then
     mkdir -p "$(dirname "$dest")"
     cp -f "$stub" "$dest"
-    codesign -f -s - "$dest" 2>/dev/null || true
+    codesign -f -s - --all-architectures "$dest" 2>/dev/null || true
     return 0
   fi
   rm -f "$stub"
@@ -52,7 +52,7 @@ nd_stage_dylib() {
     echo "Không tìm thấy NDock.dylib — chạy './ndock build' hoặc 'source ./recover.zsh build' trước." >&2
     exit 1
   fi
-  codesign -f -s - "$DYLIB" 2>/dev/null || true
+  codesign -f -s - --all-architectures "$DYLIB" 2>/dev/null || true
 }
 
 nd_write_boot_script() {
@@ -103,7 +103,7 @@ nd_uninstall() {
     if [ -f "$SCRIPT_DIR/NDock.dylib" ]; then
       mkdir -p "$NDOCK_HOME"
       cp -f "$SCRIPT_DIR/NDock.dylib" "$DYLIB"
-      codesign -f -s - "$DYLIB" 2>/dev/null || true
+      codesign -f -s - --all-architectures "$DYLIB" 2>/dev/null || true
     fi
   fi
 
@@ -279,6 +279,10 @@ case "${1:-}" in
     echo "DYLD_INSERT_LIBRARIES=$(launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null || echo '(unset)')"
     ;;
 
+  verify)
+    exec bash "$SCRIPT_DIR/scripts/verify_dock.sh" "${@:2}"
+    ;;
+
   sipcheck)
     csrutil status
     defaults read /Library/Preferences/com.apple.security.libraryvalidation.plist DisableLibraryValidation 2>/dev/null \
@@ -292,6 +296,7 @@ case "${1:-}" in
     echo "  $0 repair      — sửa khi thiếu dylib / DYLD lệch"
     echo "  $0 open -a App — mở app kèm dylib"
     echo "  $0 status      — kiểm tra trạng thái"
+    echo "  $0 verify      — build + kiểm tra widget trên Dock"
     echo "  $0 build|app|package — build (dev)"
     echo ""
     echo "Nếu mọi lệnh crash dyld: source ./recover.zsh uninstall"

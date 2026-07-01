@@ -13,9 +13,10 @@ bootstrap:
 
 build: NDock.dylib
 
-NDock.dylib: Tweak.m WindowMargin.m NDConfig.m
-	$(UNINJECT) clang -dynamiclib -framework Cocoa -o $(OUT) Tweak.m WindowMargin.m NDConfig.m $(CFLAGS)
-	$(UNINJECT) codesign -f -s - $(OUT)
+NDock.dylib: Tweak.m WindowMargin.m NDConfig.m NDStats.m NDPerf.m
+	$(UNINJECT) clang -dynamiclib -framework Cocoa -framework QuartzCore -framework IOKit \
+		-install_name "@rpath/NDock.dylib" -o $(OUT) Tweak.m WindowMargin.m NDConfig.m NDStats.m NDPerf.m $(CFLAGS)
+	$(UNINJECT) codesign -f -s - --all-architectures $(OUT)
 	@echo "Built $(OUT)"
 
 # clean: giữ NDock.dylib để tránh crash khi DYLD_INSERT_LIBRARIES trỏ vào đây
@@ -34,4 +35,7 @@ app:
 install:
 	$(UNINJECT) ./ndock install
 
-.PHONY: all build clean clean-all package app bootstrap install
+verify:
+	$(UNINJECT) bash scripts/verify_dock.sh
+
+.PHONY: all build clean clean-all package app bootstrap install verify

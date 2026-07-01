@@ -73,6 +73,11 @@ case "${1:-help}" in
     ndock_ensure_stub || return 1
     "$NDOCK_ROOT/build.sh" "$@"
     ;;
+  install-verify)
+    launchctl unsetenv DYLD_INSERT_LIBRARIES 2>/dev/null
+    launchctl unsetenv NDOCK_DEBUG 2>/dev/null
+    command bash "$NDOCK_ROOT/scripts/verify_dock.sh" --install
+    ;;
   app)
     ndock_ensure_stub || return 1
     "$NDOCK_ROOT/build.sh" build
@@ -89,6 +94,7 @@ case "${1:-help}" in
     print "  source ./recover.zsh uninstall"
     print "  source ./recover.zsh restore-stub   # khi Terminal crash vì thiếu dylib"
     print "  source ./recover.zsh stub"
+    print "  source ./recover.zsh install-verify # build + install + verify"
     print "  source ./recover.zsh build"
     print "  source ./recover.zsh app"
     print "  source ./recover.zsh package"
