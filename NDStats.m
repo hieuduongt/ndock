@@ -24,6 +24,7 @@ static CFAbsoluteTime gPrevNetTime = 0;
 static BOOL gHasNetSample = NO;
 
 static CFAbsoluteTime gLastLayoutTick = 0;
+static BOOL gVerticalCompact = NO;
 
 static NSString *NDFormatBytes(uint64_t bytes) {
     const double gb = (double)bytes / (1024.0 * 1024.0 * 1024.0);
@@ -40,11 +41,39 @@ static NSString *NDFormatDiskGB(uint64_t bytes) {
     return [NSString stringWithFormat:@"%.1fGB", gb];
 }
 
+static NSString *NDFormatDiskVertical(uint64_t bytes) {
+    const double gb = (double)bytes / (1000.0 * 1000.0 * 1000.0);
+    if (gb >= 100.0) return [NSString stringWithFormat:@"%.0fG", gb];
+    if (gb >= 10.0) return [NSString stringWithFormat:@"%.0fG", gb];
+    return [NSString stringWithFormat:@"%.1fG", gb];
+}
+
 static NSString *NDFormatRate(double bps) {
     if (bps < 1.0) return @"0 B/s";
     if (bps < 1024.0) return [NSString stringWithFormat:@"%.0f B/s", bps];
     if (bps < 1024.0 * 1024.0) return [NSString stringWithFormat:@"%.1f KB/s", bps / 1024.0];
     return [NSString stringWithFormat:@"%.1f MB/s", bps / (1024.0 * 1024.0)];
+}
+
+static NSString *NDFormatBytesShort(uint64_t bytes) {
+    const double gb = (double)bytes / (1024.0 * 1024.0 * 1024.0);
+    if (gb >= 10.0) return [NSString stringWithFormat:@"%.0fG", gb];
+    if (gb >= 1.0) return [NSString stringWithFormat:@"%.1fG", gb];
+    const double mb = (double)bytes / (1024.0 * 1024.0);
+    return [NSString stringWithFormat:@"%.0fM", mb];
+}
+
+static NSString *NDFormatRateShort(double bps) {
+    if (bps < 1.0) return @"0";
+    if (bps < 1024.0) return [NSString stringWithFormat:@"%.0fB", bps];
+    if (bps < 1024.0 * 1024.0) return [NSString stringWithFormat:@"%.0fK", bps / 1024.0];
+    return [NSString stringWithFormat:@"%.1fM", bps / (1024.0 * 1024.0)];
+}
+
+static NSString *NDFormatClockVertical(unsigned int mhz) {
+    if (mhz >= 1000)
+        return [NSString stringWithFormat:@"%.1fG", mhz / 1000.0];
+    return [NSString stringWithFormat:@"%uM", mhz];
 }
 
 static NSString *NDFormatClockMHz(unsigned int mhz) {
@@ -135,24 +164,41 @@ static void NDRefreshStats(void) {
     uint64_t diskUsed = 0, diskTotal = 0;
     unsigned int diskPct = 0;
     if (NDDiskUsage(&diskUsed, &diskTotal, &diskPct)) {
-        NDSetText(gDiskLayer, [NSString stringWithFormat:@"DISK %@/%@ %u%%",
-                              NDFormatDiskGB(diskUsed), NDFormatDiskGB(diskTotal), diskPct]);
+        if (gVerticalCompact) {
+            NDSetText(gDiskLayer, [NSString stringWithFormat:@"DISK\n%@",
+                                  NDFormatDiskVertical(diskUsed)]);
+        } else {
+            NDSetText(gDiskLayer, [NSString stringWithFormat:@"DISK %@/%@ %u%%",
+                                  NDFormatDiskGB(diskUsed), NDFormatDiskGB(diskTotal), diskPct]);
+        }
     }
 
     uint64_t ramUsed = 0, ramTotal = 0;
-    if (NDRamUsage(&ramUsed, &ramTotal))
-        NDSetText(gRamLayer, [NSString stringWithFormat:@"RAM  %@ / %@",
-                              NDFormatBytes(ramUsed), NDFormatBytes(ramTotal)]);
+    if (NDRamUsage(&ramUsed, &ramTotal)) {
+        if (gVerticalCompact) {
+            NDSetText(gRamLayer, [NSString stringWithFormat:@"RAM\n%@",
+                                  NDFormatBytesShort(ramUsed)]);
+        } else {
+            NDSetText(gRamLayer, [NSString stringWithFormat:@"RAM  %@ / %@",
+                                  NDFormatBytes(ramUsed), NDFormatBytes(ramTotal)]);
+        }
+    }
 
     unsigned int cpuMHz = 0, gpuMHz = 0;
     BOOL hasCpu = NDPerfCPUMHz(&cpuMHz);
     BOOL hasGpu = NDPerfGPUMHz(&gpuMHz);
     if (hasCpu || hasGpu) {
-        NSString *cpu = hasCpu ? NDFormatClockMHz(cpuMHz) : @"…";
-        NSString *gpu = hasGpu ? NDFormatClockMHz(gpuMHz) : @"…";
-        NDSetText(gChipLayer, [NSString stringWithFormat:@"CPU %@ | GPU %@", cpu, gpu]);
+        if (gVerticalCompact) {
+            NSString *cpu = hasCpu ? NDFormatClockVertical(cpuMHz) : @"…";
+            NSString *gpu = hasGpu ? NDFormatClockVertical(gpuMHz) : @"…";
+            NDSetText(gChipLayer, [NSString stringWithFormat:@"CPU\n%@\nGPU\n%@", cpu, gpu]);
+        } else {
+            NSString *cpu = hasCpu ? NDFormatClockMHz(cpuMHz) : @"…";
+            NSString *gpu = hasGpu ? NDFormatClockMHz(gpuMHz) : @"…";
+            NDSetText(gChipLayer, [NSString stringWithFormat:@"CPU %@ | GPU %@", cpu, gpu]);
+        }
     } else {
-        NDSetText(gChipLayer, @"CPU … | GPU …");
+        NDSetText(gChipLayer, gVerticalCompact ? @"CPU\n…\nGPU\n…" : @"CPU … | GPU …");
     }
 
     uint64_t netIn = 0, netOut = 0;
@@ -162,11 +208,16 @@ static void NDRefreshStats(void) {
             double dt = now - gPrevNetTime;
             double downBps = (netIn >= gPrevNetIn) ? (double)(netIn - gPrevNetIn) / dt : 0;
             double upBps = (netOut >= gPrevNetOut) ? (double)(netOut - gPrevNetOut) / dt : 0;
-            NDSetText(gNetUpLayer, [NSString stringWithFormat:@"↑ %@", NDFormatRate(upBps)]);
-            NDSetText(gNetDownLayer, [NSString stringWithFormat:@"↓ %@", NDFormatRate(downBps)]);
+            if (gVerticalCompact) {
+                NDSetText(gNetUpLayer, [NSString stringWithFormat:@"↑ %@", NDFormatRateShort(upBps)]);
+                NDSetText(gNetDownLayer, [NSString stringWithFormat:@"↓ %@", NDFormatRateShort(downBps)]);
+            } else {
+                NDSetText(gNetUpLayer, [NSString stringWithFormat:@"↑ %@", NDFormatRate(upBps)]);
+                NDSetText(gNetDownLayer, [NSString stringWithFormat:@"↓ %@", NDFormatRate(downBps)]);
+            }
         } else {
-            NDSetText(gNetUpLayer, @"↑ 0 B/s");
-            NDSetText(gNetDownLayer, @"↓ 0 B/s");
+            NDSetText(gNetUpLayer, gVerticalCompact ? @"↑ 0" : @"↑ 0 B/s");
+            NDSetText(gNetDownLayer, gVerticalCompact ? @"↓ 0" : @"↓ 0 B/s");
         }
         gPrevNetIn = netIn;
         gPrevNetOut = netOut;
@@ -211,5 +262,11 @@ void NDStatsTick(void) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - gLastLayoutTick < 1.2) return;
     gLastLayoutTick = now;
+    NDRefreshStats();
+}
+
+void NDStatsSetVerticalCompact(BOOL compact) {
+    if (gVerticalCompact == compact) return;
+    gVerticalCompact = compact;
     NDRefreshStats();
 }

@@ -20,6 +20,11 @@ static const CGFloat kNDWidgetIconGapPt = 4.0;
 static const CGFloat kNDWidgetTextPadPt = 8.0;
 static const CGFloat kNDWidgetLineH = 11.0;
 static const CGFloat kNDWidgetFontSize = 9.5;
+static const CGFloat kNDWidgetCompactLineH = 10.0;
+static const CGFloat kNDWidgetCompactFontSize = 8.0;
+static const CGFloat kNDWidgetCompactPadPt = 5.0;
+static const int kNDStatsCompactLines = 8;
+static const int kNDNetCompactLines = 2;
 static const CGFloat kNDWidgetMinHeightPt = 36.0;
 static const CGFloat kNDWidgetBgAlpha = 0.58;
 static const CGFloat kNDLeftWidgetWidthPt = 198.0;
@@ -115,17 +120,29 @@ static void NDLogAlways(const char *fmt, ...) {
     fclose(f);
 }
 
-static CGFloat NDWidgetCornerRadius(CGFloat widgetH);
 static void NDLayoutTextRows(CALayer *shell, CATextLayer *const *rows, int count);
+static void NDLayoutStatsCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR);
+static void NDLayoutNetCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR);
 static CGRect NDFloorRectForWidgets(CALayer *floor, CALayer *host);
 
-static CGFloat NDLeftProbeWidth(CGFloat iconW, CGFloat iconH) {
-    CGFloat scale = (iconH > 1.0) ? (iconH / kNDRefIconSizePt) : 1.0;
+static CGFloat NDLeftProbeSpan(CGFloat iconW, CGFloat iconH, BOOL vertical) {
+    CGFloat scale = vertical
+        ? ((iconW > 1.0) ? (iconW / kNDRefIconSizePt) : 1.0)
+        : ((iconH > 1.0) ? (iconH / kNDRefIconSizePt) : 1.0);
     if (scale < 0.55) scale = 0.55;
     if (scale > 2.5) scale = 2.5;
-    CGFloat designW = kNDLeftWidgetWidthPt * scale;
-    CGFloat mulW = iconW * kNDLeftProbeWidthMul;
-    return MAX(designW, mulW);
+    CGFloat design = kNDLeftWidgetWidthPt * scale;
+    CGFloat mul = (vertical ? iconH : iconW) * kNDLeftProbeWidthMul;
+    return MAX(design, mul);
+}
+
+static CGFloat NDRightProbeSpan(CGFloat iconW, CGFloat iconH, BOOL vertical) {
+    CGFloat scale = vertical
+        ? ((iconW > 1.0) ? (iconW / kNDRefIconSizePt) : 1.0)
+        : ((iconH > 1.0) ? (iconH / kNDRefIconSizePt) : 1.0);
+    if (scale < 0.55) scale = 0.55;
+    if (scale > 2.5) scale = 2.5;
+    return kNDRightWidgetWidthPt * scale;
 }
 
 /// Visual icon (Bezel item) trong host; fallback = tile.frame.
@@ -154,6 +171,39 @@ static CGRect NDHorizontalWidgetFrame(CALayer *floor, CALayer *host, CGRect floo
     CGRect tf = tile ? tile.frame : CGRectZero;
     CGFloat h = MAX(8.0, tf.size.height);
     return CGRectMake(x, tf.origin.y, w, h);
+}
+
+/// Widget dọc: X/W = tile.frame (clone slot); H kéo dài — mirror của widget ngang (Y/H tile, W kéo).
+static CGRect NDVerticalWidgetFrame(CALayer *tile, CGFloat y, CGFloat h) {
+    CGRect tf = tile ? tile.frame : CGRectZero;
+    return CGRectMake(tf.origin.x, y, MAX(8.0, tf.size.width), MAX(8.0, h));
+}
+
+/// Chiều cao pill compact = số dòng nội dung + padding (dock dọc net).
+static CGFloat NDVerticalCompactContentHeight(int lines) {
+    if (lines <= 0) return 0.0;
+    return (CGFloat)lines * kNDWidgetCompactLineH + 2.0 * kNDWidgetCompactPadPt;
+}
+
+static CALayer *NDEndmostValidTile(CALayer *host, BOOL topEnd) {
+    if (!host) return NULL;
+    CALayer *best = NULL;
+    CGFloat bestY = topEnd ? CGFLOAT_MAX : -CGFLOAT_MAX;
+    for (CALayer *s in host.sublayers) {
+        if (s == gNDProbeIcon || s == gNDRightProbeIcon
+            || s == gNDLeftShell || s == gNDRightShell) continue;
+        if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
+        CGRect f = s.frame;
+        if (f.size.width < 8.0 || f.size.height < 8.0) continue;
+        if (f.size.height > 256.0 || f.size.width > 256.0) continue;
+        CGFloat y = topEnd ? CGRectGetMinY(f) : CGRectGetMaxY(f);
+        if (topEnd) {
+            if (y < bestY) { bestY = y; best = s; }
+        } else {
+            if (y > bestY) { bestY = y; best = s; }
+        }
+    }
+    return best;
 }
 
 static CALayer *NDLeftmostValidTile(CALayer *host) {
@@ -194,6 +244,33 @@ static BOOL NDIconClusterX(CALayer *host, CGFloat *outMinX, CGFloat *outMaxX) {
     if (outMinX) *outMinX = minX;
     if (outMaxX) *outMaxX = maxX;
     return YES;
+}
+
+/// Bề dọc cụm icon (cho overlap dock trái/phải).
+static BOOL NDIconClusterY(CALayer *host, CGFloat *outMinY, CGFloat *outMaxY) {
+    if (!host) return NO;
+    CGFloat minY = CGFLOAT_MAX, maxY = -CGFLOAT_MAX;
+    int n = 0;
+    for (CALayer *s in host.sublayers) {
+        if (s == gNDProbeIcon || s == gNDRightProbeIcon
+            || s == gNDLeftShell || s == gNDRightShell) continue;
+        if (strcmp(object_getClassName(s), "DOCKTileLayer")) continue;
+        CGRect f = s.frame;
+        if (f.size.width < 8.0 || f.size.height < 8.0) continue;
+        if (CGRectGetMinY(f) < minY) minY = CGRectGetMinY(f);
+        if (CGRectGetMaxY(f) > maxY) maxY = CGRectGetMaxY(f);
+        n++;
+    }
+    if (n == 0) return NO;
+    if (outMinY) *outMinY = minY;
+    if (outMaxY) *outMaxY = maxY;
+    return YES;
+}
+
+static BOOL NDRectsOverlapY(CGRect a, CGRect b, CGFloat gap) {
+    if (CGRectIsEmpty(a) || CGRectIsEmpty(b)) return NO;
+    return !(CGRectGetMaxY(a) + gap <= CGRectGetMinY(b)
+          || CGRectGetMinY(a) >= CGRectGetMaxY(b) + gap);
 }
 
 /// Liquid glass: nền trong + viền sáng + blur phía sau (CALayer, không private API).
@@ -252,6 +329,17 @@ static void NDEnsureRightProbeIcon(CALayer *host, CALayer *floor) {
     NDEnsureGlassWidgetHost(gNDRightProbeIcon, host, floor, 551.0);
 }
 
+static void NDHideLegacyShells(void) {
+    if (gNDLeftShell) {
+        gNDLeftShell.hidden = YES;
+        gNDLeftShell.zPosition = 0.0;
+    }
+    if (gNDRightShell) {
+        gNDRightShell.hidden = YES;
+        gNDRightShell.zPosition = 0.0;
+    }
+}
+
 static CALayer *NDEnsureGlassBgLayer(CALayer *shell, CALayer *bg) {
     if (!shell) return bg;
     if (!bg) {
@@ -268,15 +356,19 @@ static CALayer *NDEnsureGlassBgLayer(CALayer *shell, CALayer *bg) {
     return bg;
 }
 
-/// Bám frame tile → nền glass inset theo icon visual + text stats.
+/// Clone tile → glass pill. Ngang: inset dọc (top/bot) theo visual icon. Dọc: inset ngang (trái/phải).
 static void NDSyncGlassWidget(CALayer *shell, CALayer *bg, CALayer *src, CGRect frame,
-                              CATextLayer *const *rows, int rowCount) {
+                              CATextLayer *const *rows, int rowCount, BOOL compactVertical) {
     if (!shell || !src || !bg || rowCount <= 0) return;
     CALayer *host = src.superlayer;
     CGRect vf = NDTileVisualRectInHost(src, host);
     CGRect tf = src.frame;
     CGFloat topIn = MAX(0.0, vf.origin.y - tf.origin.y);
     CGFloat botIn = MAX(0.0, CGRectGetMaxY(tf) - CGRectGetMaxY(vf));
+    CGFloat leftIn = MAX(0.0, vf.origin.x - tf.origin.x);
+    CGFloat rightIn = MAX(0.0, CGRectGetMaxX(tf) - CGRectGetMaxX(vf));
+    BOOL compactStats = compactVertical && rowCount == 3;
+    BOOL compactNet = compactVertical && rowCount == 2;
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -296,11 +388,18 @@ static void NDSyncGlassWidget(CALayer *shell, CALayer *bg, CALayer *src, CGRect 
     shell.masksToBounds = NO;
     shell.cornerRadius = 0.0;
     shell.opacity = 1.0f;
+    shell.hidden = NO;
 
-    CGFloat bgH = MAX(8.0, frame.size.height - topIn - botIn);
-    bg.frame = CGRectMake(0.0, topIn, frame.size.width, bgH);
+    if (compactVertical) {
+        CGFloat bgW = MAX(8.0, frame.size.width - leftIn - rightIn);
+        bg.frame = CGRectMake(leftIn, 0.0, bgW, frame.size.height);
+        bg.cornerRadius = (src.cornerRadius > 0.5) ? src.cornerRadius : bgW * 0.22;
+    } else {
+        CGFloat bgH = MAX(8.0, frame.size.height - topIn - botIn);
+        bg.frame = CGRectMake(0.0, topIn, frame.size.width, bgH);
+        bg.cornerRadius = (src.cornerRadius > 0.5) ? src.cornerRadius : bgH * 0.22;
+    }
     bg.masksToBounds = YES;
-    bg.cornerRadius = (src.cornerRadius > 0.5) ? src.cornerRadius : bgH * 0.22;
     if (bg.superlayer != shell)
         [shell insertSublayer:bg atIndex:0];
     NDApplyLiquidGlass(bg);
@@ -316,40 +415,47 @@ static void NDSyncGlassWidget(CALayer *shell, CALayer *bg, CALayer *src, CGRect 
     }
     bg.zPosition = 0.0;
     [CATransaction commit];
-    NDLayoutTextRows(shell, rows, rowCount);
+    if (compactStats)
+        NDLayoutStatsCompact(shell, leftIn, rightIn);
+    else if (compactNet)
+        NDLayoutNetCompact(shell, leftIn, rightIn);
+    else
+        NDLayoutTextRows(shell, rows, rowCount);
 }
 
-static void NDSyncProbeIcon(CALayer *src, CGRect frame) {
+static void NDSyncProbeIcon(CALayer *src, CGRect frame, BOOL compactVertical) {
     if (!gNDProbeIcon || !src) return;
     gNDProbeBgLayer = NDEnsureGlassBgLayer(gNDProbeIcon, gNDProbeBgLayer);
     CATextLayer *rows[] = { gNDDiskLayer, gNDRamLayer, gNDChipLayer };
-    NDSyncGlassWidget(gNDProbeIcon, gNDProbeBgLayer, src, frame, rows, 3);
+    NDSyncGlassWidget(gNDProbeIcon, gNDProbeBgLayer, src, frame, rows, 3, compactVertical);
 }
 
-static void NDSyncRightGlassWidget(CALayer *src, CGRect frame) {
+static void NDSyncRightGlassWidget(CALayer *src, CGRect frame, BOOL compactVertical) {
     if (!gNDRightProbeIcon || !src) return;
     gNDRightProbeBgLayer = NDEnsureGlassBgLayer(gNDRightProbeIcon, gNDRightProbeBgLayer);
     CATextLayer *rows[] = { gNDNetUpLayer, gNDNetDownLayer };
-    NDSyncGlassWidget(gNDRightProbeIcon, gNDRightProbeBgLayer, src, frame, rows, 2);
+    NDSyncGlassWidget(gNDRightProbeIcon, gNDRightProbeBgLayer, src, frame, rows, 2, compactVertical);
 }
 
-/// Gắn lại nền widget + text stats (dock dọc).
-static void NDRestoreWidgetContent(CALayer *shell, BOOL isLeft) {
-    if (!shell) return;
-    shell.backgroundColor = [[NSColor colorWithWhite:0.10 alpha:kNDWidgetBgAlpha] CGColor];
-    shell.borderColor = [[NSColor colorWithWhite:1.0 alpha:0.28] CGColor];
-    shell.borderWidth = 1.0;
-    shell.masksToBounds = YES;
-    shell.opacity = 1.0f;
-    shell.contents = nil;
-    if (isLeft) {
-        if (gNDDiskLayer.superlayer != shell) [shell addSublayer:gNDDiskLayer];
-        if (gNDRamLayer.superlayer != shell) [shell addSublayer:gNDRamLayer];
-        if (gNDChipLayer.superlayer != shell) [shell addSublayer:gNDChipLayer];
-    } else {
-        if (gNDNetUpLayer.superlayer != shell) [shell addSublayer:gNDNetUpLayer];
-        if (gNDNetDownLayer.superlayer != shell) [shell addSublayer:gNDNetDownLayer];
-    }
+static void NDSyncGlassWidgetsOnFloor(CALayer *host, CALayer *floor,
+                                      CALayer *srcStats, CALayer *srcNet,
+                                      CGRect statsFrame, CGRect netFrame,
+                                      BOOL showStats, BOOL showNet,
+                                      BOOL compactVertical) {
+    NDEnsureProbeIcon(host, floor);
+    NDEnsureRightProbeIcon(host, floor);
+    if (showStats)
+        NDSyncProbeIcon(srcStats, statsFrame, compactVertical);
+    else if (gNDProbeIcon)
+        gNDProbeIcon.hidden = YES;
+    if (showNet)
+        NDSyncRightGlassWidget(srcNet, netFrame, compactVertical);
+    else if (gNDRightProbeIcon)
+        gNDRightProbeIcon.hidden = YES;
+    if (gNDProbeBgLayer) gNDProbeBgLayer.hidden = !showStats;
+    if (gNDRightProbeBgLayer) gNDRightProbeBgLayer.hidden = !showNet;
+    NDHideLegacyShells();
+    gNDWidgetsAttached = YES;
 }
 
 static CGFloat NDAutoHorizontalSpan(NSScreen *screen) {
@@ -388,66 +494,6 @@ static CGRect NDResizeFloorFrame(CGRect rect) {
     return rect;
 }
 
-static CGFloat NDDoubleFromDockBar(id dockBar, const char *key) {
-    SEL sel = sel_getUid(key);
-    if ([dockBar respondsToSelector:sel])
-        return ((CGFloat(*)(id, SEL))objc_msgSend)(dockBar, sel);
-    @try {
-        id v = [dockBar valueForKey:[NSString stringWithUTF8String:key]];
-        if (v) return [v doubleValue];
-    } @catch (__unused NSException *e) {}
-    return 0;
-}
-
-static CGRect NDRectFromDockBar(id dockBar, const char *key) {
-    SEL sel = sel_getUid(key);
-    if ([dockBar respondsToSelector:sel])
-        return ((CGRect(*)(id, SEL))objc_msgSend)(dockBar, sel);
-    @try {
-        NSValue *v = [dockBar valueForKey:[NSString stringWithUTF8String:key]];
-        if ([v isKindOfClass:[NSValue class]]) return [v rectValue];
-    } @catch (__unused NSException *e) {}
-    return CGRectZero;
-}
-
-static BOOL NDRectsOverlapY(CGRect a, CGRect b, CGFloat gap) {
-    if (CGRectIsEmpty(a) || CGRectIsEmpty(b)) return NO;
-    return !(CGRectGetMaxY(a) + gap <= CGRectGetMinY(b)
-          || CGRectGetMaxY(b) + gap <= CGRectGetMinY(a));
-}
-
-static CGRect NDIconBarLocalRect(id dockBar, CGFloat floorW, CGFloat floorH, BOOL horizontal) {
-    if (!gNDFloorFrameValid) return CGRectZero;
-
-    if (horizontal) {
-        CGFloat barL = NDDoubleFromDockBar(dockBar, "barLeft");
-        CGFloat barR = NDDoubleFromDockBar(dockBar, "barRight");
-        if (barR > barL + 8.0) {
-            return CGRectMake(barL - gNDFloorFrame.origin.x, 0,
-                              barR - barL, floorH);
-        }
-        CGRect cluster = NDRectFromDockBar(dockBar, "fLastBarRect");
-        if (cluster.size.width > 8.0) {
-            return CGRectMake(cluster.origin.x - gNDFloorFrame.origin.x, 0,
-                              cluster.size.width, floorH);
-        }
-        return CGRectZero;
-    }
-
-    CGFloat barB = NDDoubleFromDockBar(dockBar, "barBottom");
-    CGFloat barT = NDDoubleFromDockBar(dockBar, "barTop");
-    if (barT > barB + 8.0) {
-        return CGRectMake(0, barB - gNDFloorFrame.origin.y,
-                          floorW, barT - barB);
-    }
-    CGRect cluster = NDRectFromDockBar(dockBar, "fLastBarRect");
-    if (cluster.size.height > 8.0) {
-        return CGRectMake(0, cluster.origin.y - gNDFloorFrame.origin.y,
-                        floorW, cluster.size.height);
-    }
-    return CGRectZero;
-}
-
 static void NDFloorLayoutSize(CALayer *floor, CGFloat *outW, CGFloat *outH) {
     if (!floor) return;
     if (outW) *outW = floor.bounds.size.width;
@@ -459,21 +505,6 @@ static void NDWidgetInsets(CGFloat *outTop, CGFloat *outBottom, CGFloat *outX) {
     if (outTop) *outTop = kNDWidgetInsetPt;
     if (outBottom) *outBottom = kNDWidgetInsetPt;
     if (outX) *outX = kNDWidgetInsetPt;
-}
-
-/// Widget lấp đầy band trừ lề trên/dưới 5pt → lề trên = lề dưới. Text tự căn giữa.
-static CGFloat NDWidgetShellHeight(CGFloat bandSpan) {
-    CGFloat insetTop = 0.0, insetBottom = 0.0;
-    NDWidgetInsets(&insetTop, &insetBottom, NULL);
-    return MAX(8.0, bandSpan - insetTop - insetBottom);
-}
-
-static CGFloat NDWidgetLocalY(CALayer *floor, CGFloat bandSpan, CGFloat widgetH) {
-    CGFloat insetTop = 0.0, insetBottom = 0.0;
-    NDWidgetInsets(&insetTop, &insetBottom, NULL);
-    if (floor.geometryFlipped)
-        return insetTop;
-    return bandSpan - insetBottom - widgetH;
 }
 
 static BOOL NDFloorShapeMatchesDock(BOOL dockHorizontal, CGFloat floorW, CGFloat floorH) {
@@ -499,8 +530,15 @@ static CGRect NDFloorRectInHost(CALayer *floor, CALayer *host) {
 /// gNDFloorFrame là frame đã settle từ setFloorFrame: (đúng host coords) → dùng trọn vẹn
 /// để widget đứng yên tại vị trí đích, không dao động theo animation.
 static CGRect NDFloorRectForWidgets(CALayer *floor, CALayer *host) {
-    if (gNDFloorFrameValid) return gNDFloorFrame;
-    return NDFloorRectInHost(floor, host);
+    if (!gNDFloorFrameValid)
+        return NDFloorRectInHost(floor, host);
+    if (NDIsVerticalFloorRect(gNDFloorFrame) && floor && host) {
+        CGRect measured = NDFloorRectInHost(floor, host);
+        if (!CGRectIsEmpty(measured) && measured.size.width > 8.0)
+            return CGRectMake(measured.origin.x, measured.origin.y,
+                            gNDFloorFrame.size.width, gNDFloorFrame.size.height);
+    }
+    return gNDFloorFrame;
 }
 
 static BOOL NDFloorHostUsable(CGRect floorInHost, BOOL horizontal, CGFloat floorW, CGFloat floorH) {
@@ -515,69 +553,6 @@ static BOOL NDFloorHostUsable(CGRect floorInHost, BOOL horizontal, CGFloat floor
         if (CGRectGetHeight(floorInHost) < kNDMinRealSpan * 0.5) return NO;
     }
     return YES;
-}
-
-/// Đặt widget trong host từ floorInHost; căn đáy cách maxY đúng insetBottom.
-static CGRect NDWidgetHostFrame(CGRect floorInHost, BOOL horizontal, BOOL isRight,
-                                CGFloat insetX, CGFloat insetTop, CGFloat insetBottom,
-                                CGFloat w, CGFloat h) {
-    if (horizontal) {
-        CGFloat x = isRight
-            ? CGRectGetMaxX(floorInHost) - insetX - w
-            : CGRectGetMinX(floorInHost) + insetX;
-        CGFloat y = CGRectGetMaxY(floorInHost) - insetBottom - h;
-        return CGRectMake(x, y, w, h);
-    }
-    CGFloat x = CGRectGetMinX(floorInHost) + insetX;
-    CGFloat y = isRight
-        ? CGRectGetMinY(floorInHost) + insetTop
-        : CGRectGetMaxY(floorInHost) - insetBottom - h;
-    return CGRectMake(x, y, w, h);
-}
-
-static CALayer *NDTopHostLayerBelowWidgets(CALayer *host, CALayer *floor) {
-    CALayer *top = floor;
-    CGFloat topZ = floor ? floor.zPosition : 0.0;
-    for (CALayer *sub in host.sublayers) {
-        if (sub == gNDLeftShell || sub == gNDRightShell) continue;
-        if (sub.zPosition >= topZ) {
-            topZ = sub.zPosition;
-            top = sub;
-        }
-    }
-    return top ?: floor;
-}
-
-/// Con của host, trên floor/glass; frame host từ floor-local.
-static void NDEnsureWidgetsAboveGlass(CALayer *floor) {
-    CALayer *host = floor ? floor.superlayer : NULL;
-    if (!host || !gNDLeftShell || !gNDRightShell) return;
-
-    CALayer *anchor = NDTopHostLayerBelowWidgets(host, floor);
-    CGFloat maxZ = anchor.zPosition;
-    for (CALayer *sub in host.sublayers) {
-        if (sub == gNDLeftShell || sub == gNDRightShell) continue;
-        if (sub.zPosition > maxZ) maxZ = sub.zPosition;
-    }
-    BOOL needReparent = gNDLeftShell.superlayer != host
-        || gNDRightShell.superlayer != host
-        || gNDLeftShell.zPosition <= maxZ;
-    if (needReparent) {
-        [gNDLeftShell removeFromSuperlayer];
-        [host insertSublayer:gNDLeftShell above:anchor];
-        [gNDRightShell removeFromSuperlayer];
-        [host insertSublayer:gNDRightShell above:anchor];
-        maxZ = anchor.zPosition;
-        for (CALayer *sub in host.sublayers) {
-            if (sub == gNDLeftShell || sub == gNDRightShell) continue;
-            if (sub.zPosition > maxZ) maxZ = sub.zPosition;
-        }
-    }
-    gNDLeftShell.zPosition = maxZ + 500.0;
-    gNDRightShell.zPosition = maxZ + 501.0;
-    gNDLeftShell.geometryFlipped = NO;
-    gNDRightShell.geometryFlipped = NO;
-    gNDWidgetsAttached = YES;
 }
 
 static CATextLayer *NDMakeText(NSString *text, NSColor *color) {
@@ -602,15 +577,67 @@ static void NDLayoutTextRows(CALayer *shell, CATextLayer *const *rows, int count
     CGFloat pad = MAX(0.0, (h - totalH) * 0.5);
     CGFloat textW = MAX(1.0, w - 2.0 * kNDWidgetTextPadPt);
     for (int i = 0; i < count; i++) {
+        CATextLayer *row = rows[i];
+        row.wrapped = NO;
+        row.alignmentMode = kCAAlignmentLeft;
+        row.fontSize = kNDWidgetFontSize;
+        row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDWidgetFontSize
+                                                           weight:NSFontWeightMedium];
         CGFloat rowY = shell.geometryFlipped
             ? (pad + (CGFloat)i * kNDWidgetLineH)
             : (h - pad - (CGFloat)(i + 1) * kNDWidgetLineH);
-        rows[i].frame = CGRectMake(kNDWidgetTextPadPt, rowY, textW, kNDWidgetLineH);
+        row.frame = CGRectMake(kNDWidgetTextPadPt, rowY, textW, kNDWidgetLineH);
     }
 }
 
-static CGFloat NDWidgetCornerRadius(CGFloat widgetH) {
-    return MIN(12.0, MAX(6.0, widgetH * 0.24));
+static void NDApplyCompactTextStyle(CATextLayer *row, CGRect frame) {
+    row.wrapped = YES;
+    row.alignmentMode = kCAAlignmentCenter;
+    row.fontSize = kNDWidgetCompactFontSize;
+    row.font = (__bridge CFTypeRef)[NSFont monospacedDigitSystemFontOfSize:kNDWidgetCompactFontSize
+                                                                      weight:NSFontWeightMedium];
+    row.frame = frame;
+}
+
+/// Text compact trong vùng glass (inset ngang theo visual icon, căn giữa).
+static void NDLayoutStatsCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR) {
+    if (!shell || !gNDDiskLayer || !gNDRamLayer || !gNDChipLayer) return;
+    CGFloat w = shell.bounds.size.width;
+    CGFloat h = shell.bounds.size.height;
+    if (w < 1.0 || h < 1.0) return;
+
+    static const int kLineCounts[] = { 2, 2, 4 };
+    CATextLayer *rows[] = { gNDDiskLayer, gNDRamLayer, gNDChipLayer };
+    CGFloat totalH = (CGFloat)kNDStatsCompactLines * kNDWidgetCompactLineH;
+    CGFloat pad = MAX(0.0, (h - totalH) * 0.5);
+    CGFloat textX = sideInL + kNDWidgetCompactPadPt;
+    CGFloat textW = MAX(1.0, w - sideInL - sideInR - 2.0 * kNDWidgetCompactPadPt);
+    CGFloat yTop = h - pad;
+
+    for (int i = 0; i < 3; i++) {
+        CGFloat blockH = (CGFloat)kLineCounts[i] * kNDWidgetCompactLineH;
+        yTop -= blockH;
+        NDApplyCompactTextStyle(rows[i], CGRectMake(textX, yTop, textW, blockH));
+    }
+}
+
+static void NDLayoutNetCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR) {
+    if (!shell || !gNDNetUpLayer || !gNDNetDownLayer) return;
+    CGFloat w = shell.bounds.size.width;
+    CGFloat h = shell.bounds.size.height;
+    if (w < 1.0 || h < 1.0) return;
+
+    CATextLayer *rows[] = { gNDNetUpLayer, gNDNetDownLayer };
+    CGFloat totalH = (CGFloat)kNDNetCompactLines * kNDWidgetCompactLineH;
+    CGFloat pad = MAX(0.0, (h - totalH) * 0.5);
+    CGFloat textX = sideInL + kNDWidgetCompactPadPt;
+    CGFloat textW = MAX(1.0, w - sideInL - sideInR - 2.0 * kNDWidgetCompactPadPt);
+    CGFloat yTop = h - pad;
+
+    for (int i = 0; i < 2; i++) {
+        yTop -= kNDWidgetCompactLineH;
+        NDApplyCompactTextStyle(rows[i], CGRectMake(textX, yTop, textW, kNDWidgetCompactLineH));
+    }
 }
 
 static CALayer *NDMakeLayerShell(void) {
@@ -728,7 +755,6 @@ static void NDLayoutWidgets(id dockBar) {
         CGFloat insetTop = 0.0, insetBottom = 0.0, insetX = 0.0;
         NDWidgetInsets(&insetTop, &insetBottom, &insetX);
 
-        NDEnsureWidgetsAboveGlass(floor);
         CALayer *host = floor.superlayer;
         if (!host) {
             gNDInWidgetLayout = NO;
@@ -737,11 +763,16 @@ static void NDLayoutWidgets(id dockBar) {
 
         CGRect leftHost = CGRectZero, rightHost = CGRectZero;
         CGRect refTile = CGRectZero;
-        CGFloat widgetH = 0.0;
+        CGFloat refCross = 0.0;
         BOOL leftOverlap = NO, rightOverlap = NO;
+        CGRect floorInHost = NDFloorRectForWidgets(floor, host);
+        if (!NDFloorHostUsable(floorInHost, horizontal, floorW, floorH)) {
+            gNDInWidgetLayout = NO;
+            return;
+        }
 
         if (horizontal) {
-            // Bám Y/H từ tile (căn giữa giống icon); X từ floor + inset trái/phải.
+            NDStatsSetVerticalCompact(NO);
             CALayer *src = NDLeftmostValidTile(host);
             if (!src) {
                 gNDInWidgetLayout = NO;
@@ -749,128 +780,112 @@ static void NDLayoutWidgets(id dockBar) {
             }
             CGRect sf = src.frame;
             refTile = sf;
-            widgetH = sf.size.height;
+            refCross = sf.size.height;
 
-            CGRect floorInHost = NDFloorRectForWidgets(floor, host);
-            if (!NDFloorHostUsable(floorInHost, horizontal, floorW, floorH)) {
-                gNDInWidgetLayout = NO;
-                return;
-            }
-
-            CGFloat probeW = NDLeftProbeWidth(sf.size.width, sf.size.height);
+            CGFloat probeW = NDLeftProbeSpan(sf.size.width, sf.size.height, NO);
+            CGFloat rightW = NDRightProbeSpan(sf.size.width, sf.size.height, NO);
             CGFloat leftX = CGRectGetMinX(floorInHost) + insetX;
-            CGRect iconClone = NDHorizontalWidgetFrame(floor, host, floorInHost, src,
-                                                         leftX, probeW);
-            leftHost = iconClone;
-            CGFloat rightX = CGRectGetMaxX(floorInHost) - insetX - kNDRightWidgetWidthPt;
-            rightHost = NDHorizontalWidgetFrame(floor, host, floorInHost, src,
-                                                rightX, kNDRightWidgetWidthPt);
+            leftHost = NDHorizontalWidgetFrame(floor, host, floorInHost, src, leftX, probeW);
+            CGFloat rightX = CGRectGetMaxX(floorInHost) - insetX - rightW;
+            rightHost = NDHorizontalWidgetFrame(floor, host, floorInHost, src, rightX, rightW);
+
             CGFloat clusterMinX = sf.origin.x, clusterMaxX = CGRectGetMaxX(sf);
             NDIconClusterX(host, &clusterMinX, &clusterMaxX);
-            leftOverlap = CGRectGetMaxX(iconClone) + kNDWidgetIconGapPt > clusterMinX;
+            leftOverlap = CGRectGetMaxX(leftHost) + kNDWidgetIconGapPt > clusterMinX;
             rightOverlap = CGRectGetMinX(rightHost) - kNDWidgetIconGapPt < clusterMaxX;
-            NDEnsureProbeIcon(host, floor);
-            NDEnsureRightProbeIcon(host, floor);
-            NDSyncProbeIcon(src, iconClone);
-            NDSyncRightGlassWidget(src, rightHost);
-            if (gNDProbeBgLayer) gNDProbeBgLayer.hidden = NO;
-            if (gNDRightProbeBgLayer) gNDRightProbeBgLayer.hidden = NO;
-            gNDLeftShell.hidden = YES;
-            gNDRightShell.hidden = YES;
-            gNDProbeIcon.hidden = leftOverlap;
-            if (gNDRightProbeIcon) {
-                gNDRightProbeIcon.hidden = rightOverlap;
-                if (!rightOverlap) gNDRightProbeIcon.opacity = 1.0f;
-            }
+            NDSyncGlassWidgetsOnFloor(host, floor, src, src, leftHost, rightHost,
+                                      !leftOverlap, !rightOverlap, NO);
         } else {
-            // Dock dọc: giữ logic cũ theo floor/glass (đường ít dùng, tránh hồi quy).
-            CGFloat bandSpan = floorW;
-            widgetH = NDWidgetShellHeight(bandSpan);
-            CGFloat widgetY = NDWidgetLocalY(floor, bandSpan, widgetH);
-            CGRect floorInHost = NDFloorRectForWidgets(floor, host);
-            if (!NDFloorHostUsable(floorInHost, horizontal, floorW, floorH)) {
+            NDStatsSetVerticalCompact(YES);
+            CALayer *src = NDEndmostValidTile(host, NO);
+            if (!src) {
                 gNDInWidgetLayout = NO;
                 return;
             }
-            CGFloat slotW = MAX(8.0, floorW - 2.0 * insetX);
-            CGRect leftLocal = CGRectMake(insetX, widgetY, slotW, widgetH);
-            CGRect rightLocal = CGRectMake(insetX, floorH - widgetY - widgetH, slotW, widgetH);
-            CGRect icons = dockBar ? NDIconBarLocalRect(dockBar, floorW, floorH, horizontal)
-                                   : CGRectZero;
-            leftOverlap = NDRectsOverlapY(leftLocal, icons, kNDWidgetIconGapPt);
-            rightOverlap = NDRectsOverlapY(rightLocal, icons, kNDWidgetIconGapPt);
-            leftHost = NDWidgetHostFrame(floorInHost, horizontal, NO,
-                                         insetX, insetTop, insetBottom, slotW, widgetH);
-            rightHost = NDWidgetHostFrame(floorInHost, horizontal, YES,
-                                          insetX, insetTop, insetBottom, slotW, widgetH);
-            refTile = floorInHost;
+            CGRect sf = src.frame;
+            refTile = sf;
+            refCross = sf.size.width;
+
+            CGFloat floorTop = CGRectGetMinY(floorInHost) + insetTop;
+            CGFloat floorBot = CGRectGetMaxY(floorInHost) - insetBottom;
+            CGFloat clusterMinY = sf.origin.y, clusterMaxY = CGRectGetMaxY(sf);
+            if (!NDIconClusterY(host, &clusterMinY, &clusterMaxY)) {
+                clusterMinY = sf.origin.y;
+                clusterMaxY = CGRectGetMaxY(sf);
+            }
+
+            CGFloat wantStatsH = NDVerticalCompactContentHeight(kNDStatsCompactLines);
+            CGFloat wantNetH = NDVerticalCompactContentHeight(kNDNetCompactLines);
+            CGFloat maxStatsH = floorBot - clusterMaxY - kNDWidgetIconGapPt;
+            CGFloat maxNetH = clusterMinY - floorTop - kNDWidgetIconGapPt;
+            CGFloat statsH = MIN(wantStatsH, MAX(0.0, maxStatsH));
+            CGFloat netH = MIN(wantNetH, MAX(0.0, maxNetH));
+
+            CGFloat bottomY = floorBot - statsH;
+            CGFloat topY = floorTop;
+            leftHost = NDVerticalWidgetFrame(src, bottomY, statsH);
+            rightHost = NDVerticalWidgetFrame(src, topY, netH);
+
+            CGFloat minStatsH = NDVerticalCompactContentHeight(kNDStatsCompactLines);
+            CGFloat minNetH = NDVerticalCompactContentHeight(kNDNetCompactLines);
+            leftOverlap = statsH < minStatsH
+                       || NDRectsOverlapY(leftHost,
+                            CGRectMake(leftHost.origin.x, clusterMinY,
+                                       leftHost.size.width, clusterMaxY - clusterMinY),
+                            kNDWidgetIconGapPt);
+            rightOverlap = netH < minNetH
+                        || NDRectsOverlapY(rightHost,
+                             CGRectMake(rightHost.origin.x, clusterMinY,
+                                        rightHost.size.width, clusterMaxY - clusterMinY),
+                             kNDWidgetIconGapPt);
+            NDSyncGlassWidgetsOnFloor(host, floor, src, src, leftHost, rightHost,
+                                      !leftOverlap, !rightOverlap, YES);
         }
 
-        if (leftHost.origin.y < 0.0 || rightHost.origin.y < 0.0) {
-            gNDInWidgetLayout = NO;
-            return;
+        {
+            CGFloat floorMinY = CGRectGetMinY(floorInHost);
+            CGFloat floorMaxY = CGRectGetMaxY(floorInHost);
+            if (CGRectGetMaxY(leftHost) > floorMaxY + 2.0
+                || CGRectGetMinY(rightHost) < floorMinY - 2.0
+                || leftHost.size.height < 1.0 || rightHost.size.height < 1.0) {
+                gNDInWidgetLayout = NO;
+                return;
+            }
         }
 
-        if (!horizontal) {
-            if (gNDRightProbeBgLayer) gNDRightProbeBgLayer.hidden = YES;
-            if (gNDProbeBgLayer) gNDProbeBgLayer.hidden = YES;
-            if (gNDRightProbeIcon) gNDRightProbeIcon.hidden = YES;
-            NDRestoreWidgetContent(gNDLeftShell, YES);
-            NDRestoreWidgetContent(gNDRightShell, NO);
-            CGFloat radius = NDWidgetCornerRadius(widgetH);
-            [CATransaction begin];
-            [CATransaction setDisableActions:YES];
-            gNDLeftShell.cornerRadius = radius;
-            gNDRightShell.cornerRadius = radius;
-            gNDLeftShell.frame = leftHost;
-            gNDRightShell.frame = rightHost;
-            [CATransaction commit];
-            CATextLayer *leftRows[] = { gNDDiskLayer, gNDRamLayer, gNDChipLayer };
-            CATextLayer *rightRows[] = { gNDNetUpLayer, gNDNetDownLayer };
-            NDLayoutTextRows(gNDLeftShell, leftRows, 3);
-            NDLayoutTextRows(gNDRightShell, rightRows, 2);
+        gNDProbeIcon.hidden = leftOverlap;
+        if (gNDRightProbeIcon) {
+            gNDRightProbeIcon.hidden = rightOverlap;
+            if (!rightOverlap) gNDRightProbeIcon.opacity = 1.0f;
         }
-        if (!horizontal) {
-            gNDLeftShell.hidden = leftOverlap;
-            if (!leftOverlap) gNDLeftShell.opacity = 1.0f;
-            gNDRightShell.hidden = rightOverlap;
-            if (!rightOverlap) gNDRightShell.opacity = 1.0f;
-        }
-
-        if (!horizontal && gNDProbeIcon)
-            gNDProbeIcon.hidden = YES;
+        if (!leftOverlap) gNDProbeIcon.opacity = 1.0f;
 
         if (NDDebugEnabled() && !gNDVerifyLogged && gNDWidgetsAttached) {
-            BOOL onHost = gNDRightShell.superlayer == host;
-            BOOL dimOk = gNDRightShell.frame.size.width > 10;
-            BOOL visOk = !gNDRightShell.hidden;
-            BOOL zOk = gNDRightShell.zPosition > floor.zPosition;
-            if (horizontal) {
-                onHost = gNDProbeIcon.superlayer == host
-                      && gNDRightProbeIcon.superlayer == host;
-                dimOk = gNDProbeIcon.frame.size.width > 10
+            BOOL onHost = gNDProbeIcon.superlayer == host
+                       && gNDRightProbeIcon.superlayer == host;
+            BOOL dimOk = gNDProbeIcon.frame.size.width > 10
                       && gNDRightProbeIcon.frame.size.width > 10;
-                visOk = !gNDProbeIcon.hidden && !gNDRightProbeIcon.hidden;
-                zOk = gNDProbeIcon.zPosition > floor.zPosition
+            BOOL visOk = !gNDProbeIcon.hidden && !gNDRightProbeIcon.hidden;
+            BOOL zOk = gNDProbeIcon.zPosition > floor.zPosition
                     && gNDRightProbeIcon.zPosition > floor.zPosition;
-            } else {
-                onHost = onHost && gNDLeftShell.superlayer == host;
-                dimOk = dimOk && gNDLeftShell.frame.size.width > 10;
-                visOk = visOk || !gNDLeftShell.hidden;
-                zOk = zOk && gNDLeftShell.zPosition > floor.zPosition;
-            }
             BOOL tileOk;
             if (horizontal) {
-                CGRect fh = NDFloorRectForWidgets(floor, host);
-                CGFloat leftM = leftHost.origin.x - CGRectGetMinX(fh);
-                tileOk = fabs(widgetH - refTile.size.height) < 0.5
+                CGFloat leftM = leftHost.origin.x - CGRectGetMinX(floorInHost);
+                tileOk = fabs(refCross - refTile.size.height) < 0.5
                       && fabs(leftM - insetX) < 1.0
                       && fabs(leftHost.origin.y - refTile.origin.y) < 0.5;
             } else {
-                tileOk = widgetH > 8.0;
+                CGFloat bottomM = CGRectGetMaxY(floorInHost) - CGRectGetMaxY(leftHost);
+                tileOk = fabs(refCross - refTile.size.width) < 0.5
+                      && fabs(leftHost.origin.x - refTile.origin.x) < 0.5
+                      && fabs(rightHost.origin.x - refTile.origin.x) < 0.5
+                      && fabs(leftHost.size.width - refTile.size.width) < 0.5
+                      && fabs(bottomM - insetBottom) < 1.5
+                      && fabs(rightHost.origin.y - CGRectGetMinY(floorInHost) - insetTop) < 1.5;
             }
             BOOL ok = onHost && dimOk && visOk && tileOk && zOk;
-            NDLogAlways("VERIFY widgets=%s dock=ok", ok ? "PASS" : "FAIL");
+            NDLogAlways("VERIFY widgets=%s dock=%s", ok ? "PASS" : "FAIL",
+                        horizontal ? "H" : "V");
             gNDVerifyLogged = YES;
         }
         NDStatsTick();
