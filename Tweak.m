@@ -647,7 +647,7 @@ static CATextLayer *NDMakeText(NSString *text, NSColor *color) {
     CATextLayer *t = [CATextLayer layer];
     t.contentsScale = NSScreen.mainScreen.backingScaleFactor;
     t.string = text;
-    t.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDWidgetFontSize weight:NSFontWeightMedium];
+    t.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDWidgetFontSize weight:NSFontWeightSemibold];
     t.fontSize = kNDWidgetFontSize;
     t.foregroundColor = color.CGColor;
     t.alignmentMode = kCAAlignmentLeft;
@@ -670,7 +670,7 @@ static void NDLayoutTextRows(CALayer *shell, CATextLayer *const *rows, int count
         row.alignmentMode = kCAAlignmentLeft;
         row.fontSize = kNDWidgetFontSize;
         row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDWidgetFontSize
-                                                           weight:NSFontWeightMedium];
+                                                           weight:NSFontWeightSemibold];
         CGFloat rowY = shell.geometryFlipped
             ? (pad + (CGFloat)i * kNDWidgetLineH)
             : (h - pad - (CGFloat)(i + 1) * kNDWidgetLineH);
@@ -689,7 +689,7 @@ static NSString *NDTextLayerPlainString(CATextLayer *layer) {
 /// Dock ngang: max(rộng text hiện tại, rộng chuỗi dự phòng) + padding + fudge render.
 static CGFloat NDHorizontalMeasureString(NSString *text) {
     if (!text.length) return 0.0;
-    NSFont *font = [NSFont systemFontOfSize:kNDWidgetFontSize weight:NSFontWeightMedium];
+    NSFont *font = [NSFont systemFontOfSize:kNDWidgetFontSize weight:NSFontWeightSemibold];
     return ceil([text sizeWithAttributes:@{ NSFontAttributeName: font }].width);
 }
 
@@ -712,7 +712,7 @@ static void NDApplyCompactTextStyle(CATextLayer *row, CGRect frame) {
     row.alignmentMode = kCAAlignmentCenter;
     row.fontSize = kNDWidgetCompactFontSize;
     row.font = (__bridge CFTypeRef)[NSFont monospacedDigitSystemFontOfSize:kNDWidgetCompactFontSize
-                                                                      weight:NSFontWeightMedium];
+                                                                      weight:NSFontWeightSemibold];
     row.frame = frame;
 }
 
@@ -773,8 +773,8 @@ static CALayer *NDMakeLayerShell(void) {
 static void NDEnsureWidgets(void) {
     if (gNDLeftShell) return;
 
-    NSColor *hi = [[NSColor whiteColor] colorWithAlphaComponent:0.94];
-    NSColor *lo = [[NSColor whiteColor] colorWithAlphaComponent:0.76];
+    NSColor *hi = [[NSColor blackColor] colorWithAlphaComponent:0.94];
+    NSColor *lo = [[NSColor blackColor] colorWithAlphaComponent:0.76];
 
     gNDLeftShell = NDMakeLayerShell();
     gNDRightShell = NDMakeLayerShell();
