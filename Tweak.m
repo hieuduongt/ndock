@@ -27,11 +27,16 @@ static const int kNDStatsCompactLines = 8;
 static const int kNDNetCompactLines = 2;
 static const CGFloat kNDWidgetMinHeightPt = 36.0;
 static const CGFloat kNDWidgetBgAlpha = 0.58;
-static const CGFloat kNDLeftWidgetWidthPt = 198.0;
-static const CGFloat kNDRightWidgetWidthPt = 132.0;
-/// Probe trái: rộng tối thiểu ~3× tile thiết kế (198pt @ icon ~43pt), scale theo icon khi resize.
-static const CGFloat kNDLeftProbeWidthMul = 3.0;
-static const CGFloat kNDRefIconSizePt = 43.0;
+
+/// Chuỗi dự phòng đo rộng pill ngang (đơn vị scale tối đa, tránh cắt khi giá trị tăng).
+static NSString * const kNDHorizDiskReserve = @"DISK 999GB/999GB 100%";
+static NSString * const kNDHorizRamReserve = @"RAM  999 GB / 999 GB";
+/// GHz max (%.1f) và MHz max (%u<1000) — lấy rộng hơn khi đo stats.
+static NSString * const kNDHorizChipReserveGHz = @"CPU 100.0GHz | GPU 100.0GHz";
+static NSString * const kNDHorizChipReserveMHz = @"CPU 999MHz | GPU 999MHz";
+static NSString * const kNDHorizNetUpReserve = @"↑ 9.999 KB/s";
+static NSString * const kNDHorizNetDownReserve = @"↓ 9.999 MB/s";
+static const CGFloat kNDHorizontalMeasureFudgePt = 10.0;
 
 typedef void (*set_rect_fn)(id, SEL, CGRect);
 typedef void (*void_fn)(id, SEL);
@@ -124,26 +129,6 @@ static void NDLayoutTextRows(CALayer *shell, CATextLayer *const *rows, int count
 static void NDLayoutStatsCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR);
 static void NDLayoutNetCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR);
 static CGRect NDFloorRectForWidgets(CALayer *floor, CALayer *host);
-
-static CGFloat NDLeftProbeSpan(CGFloat iconW, CGFloat iconH, BOOL vertical) {
-    CGFloat scale = vertical
-        ? ((iconW > 1.0) ? (iconW / kNDRefIconSizePt) : 1.0)
-        : ((iconH > 1.0) ? (iconH / kNDRefIconSizePt) : 1.0);
-    if (scale < 0.55) scale = 0.55;
-    if (scale > 2.5) scale = 2.5;
-    CGFloat design = kNDLeftWidgetWidthPt * scale;
-    CGFloat mul = (vertical ? iconH : iconW) * kNDLeftProbeWidthMul;
-    return MAX(design, mul);
-}
-
-static CGFloat NDRightProbeSpan(CGFloat iconW, CGFloat iconH, BOOL vertical) {
-    CGFloat scale = vertical
-        ? ((iconW > 1.0) ? (iconW / kNDRefIconSizePt) : 1.0)
-        : ((iconH > 1.0) ? (iconH / kNDRefIconSizePt) : 1.0);
-    if (scale < 0.55) scale = 0.55;
-    if (scale > 2.5) scale = 2.5;
-    return kNDRightWidgetWidthPt * scale;
-}
 
 /// Visual icon (Bezel item) trong host; fallback = tile.frame.
 static CGRect NDTileVisualRectInHost(CALayer *tile, CALayer *host) {
@@ -590,6 +575,35 @@ static void NDLayoutTextRows(CALayer *shell, CATextLayer *const *rows, int count
     }
 }
 
+static NSString *NDTextLayerPlainString(CATextLayer *layer) {
+    if (!layer) return @"";
+    id str = layer.string;
+    if ([str isKindOfClass:[NSString class]]) return (NSString *)str;
+    if ([str isKindOfClass:[NSAttributedString class]]) return [(NSAttributedString *)str string];
+    return @"";
+}
+
+/// Dock ngang: max(rộng text hiện tại, rộng chuỗi dự phòng) + padding + fudge render.
+static CGFloat NDHorizontalMeasureString(NSString *text) {
+    if (!text.length) return 0.0;
+    NSFont *font = [NSFont systemFontOfSize:kNDWidgetFontSize weight:NSFontWeightMedium];
+    return ceil([text sizeWithAttributes:@{ NSFontAttributeName: font }].width);
+}
+
+static CGFloat NDHorizontalContentWidth(CATextLayer *const *rows, int count,
+                                        NSString *const *reserve, int reserveCount,
+                                        NSString *const *extra, int extraCount) {
+    CGFloat maxW = 0.0;
+    for (int i = 0; i < count; i++) {
+        maxW = MAX(maxW, NDHorizontalMeasureString(NDTextLayerPlainString(rows[i])));
+        if (reserve && i < reserveCount)
+            maxW = MAX(maxW, NDHorizontalMeasureString(reserve[i]));
+    }
+    for (int j = 0; extra && j < extraCount; j++)
+        maxW = MAX(maxW, NDHorizontalMeasureString(extra[j]));
+    return MAX(40.0, maxW + kNDHorizontalMeasureFudgePt + 2.0 * kNDWidgetTextPadPt);
+}
+
 static void NDApplyCompactTextStyle(CATextLayer *row, CGRect frame) {
     row.wrapped = YES;
     row.alignmentMode = kCAAlignmentCenter;
@@ -773,6 +787,7 @@ static void NDLayoutWidgets(id dockBar) {
 
         if (horizontal) {
             NDStatsSetVerticalCompact(NO);
+            NDStatsTick();
             CALayer *src = NDLeftmostValidTile(host);
             if (!src) {
                 gNDInWidgetLayout = NO;
@@ -782,8 +797,13 @@ static void NDLayoutWidgets(id dockBar) {
             refTile = sf;
             refCross = sf.size.height;
 
-            CGFloat probeW = NDLeftProbeSpan(sf.size.width, sf.size.height, NO);
-            CGFloat rightW = NDRightProbeSpan(sf.size.width, sf.size.height, NO);
+            CATextLayer *statsRows[] = { gNDDiskLayer, gNDRamLayer, gNDChipLayer };
+            CATextLayer *netRows[] = { gNDNetUpLayer, gNDNetDownLayer };
+            NSString *statsReserve[] = { kNDHorizDiskReserve, kNDHorizRamReserve, kNDHorizChipReserveGHz };
+            NSString *statsExtra[] = { kNDHorizChipReserveMHz };
+            NSString *netReserve[] = { kNDHorizNetUpReserve, kNDHorizNetDownReserve };
+            CGFloat probeW = NDHorizontalContentWidth(statsRows, 3, statsReserve, 3, statsExtra, 1);
+            CGFloat rightW = NDHorizontalContentWidth(netRows, 2, netReserve, 2, NULL, 0);
             CGFloat leftX = CGRectGetMinX(floorInHost) + insetX;
             leftHost = NDHorizontalWidgetFrame(floor, host, floorInHost, src, leftX, probeW);
             CGFloat rightX = CGRectGetMaxX(floorInHost) - insetX - rightW;
