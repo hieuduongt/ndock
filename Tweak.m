@@ -36,7 +36,6 @@ static const CGFloat kNDMediaCompactCtrlFontSize = 10.0;
 static const CGFloat kNDMediaCompactCtrlSideFontSize = 11.5;
 static const CGFloat kNDMediaArtistLineH = 9.0;
 static const CGFloat kNDWidgetMinHeightPt = 36.0;
-static const CGFloat kNDWidgetBgAlpha = 0.58;
 
 /// Chuỗi dự phòng đo rộng pill ngang (đơn vị scale tối đa, tránh cắt khi giá trị tăng).
 static NSString * const kNDHorizDiskReserve = @"DISK 999GB/999GB 100%";
@@ -553,21 +552,43 @@ static BOOL NDRectsOverlapY(CGRect a, CGRect b, CGFloat gap) {
           || CGRectGetMinY(a) >= CGRectGetMaxY(b) + gap);
 }
 
-/// Liquid glass: nền trong + viền sáng + blur phía sau (CALayer, không private API).
+static BOOL NDIsMacOSTahoeOrNewer(void) {
+    NSOperatingSystemVersion version = [[NSProcessInfo processInfo] operatingSystemVersion];
+    return version.majorVersion >= 26;
+}
+
+static BOOL NDIsDarkSystemAppearance(void) {
+    if (@available(macOS 10.14, *)) {
+        NSAppearance *appearance = [NSAppearance currentDrawingAppearance];
+        NSAppearanceName best = [appearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]];
+        return [best isEqualToString:NSAppearanceNameDarkAqua];
+    }
+    return NO;
+}
+
 static void NDApplyLiquidGlass(CALayer *layer) {
     if (!layer) return;
-    layer.backgroundColor = [[NSColor colorWithWhite:1.0 alpha:0.16] CGColor];
-    layer.borderColor = [[NSColor colorWithWhite:1.0 alpha:0.42] CGColor];
-    layer.borderWidth = 0.5;
-    layer.shadowOpacity = 0.0;
-    if (layer.backgroundFilters.count > 0) return;
-    @try {
-        CIFilter *blur = [CIFilter filterWithName:@"CIGaussianBlur"];
-        if (blur) {
-            [blur setValue:@(14.0) forKey:kCIInputRadiusKey];
-            layer.backgroundFilters = @[blur];
-        }
-    } @catch (__unused NSException *e) {}
+
+    BOOL dark = NDIsDarkSystemAppearance();
+    BOOL tahoe = NDIsMacOSTahoeOrNewer();
+    NSColor *fill = dark
+        ? [[NSColor underPageBackgroundColor] colorWithAlphaComponent:0.22]
+        : [[NSColor windowBackgroundColor] colorWithAlphaComponent: 0.22];
+    NSColor *border = [[NSColor separatorColor] colorWithAlphaComponent:dark ? 0.28 : 0.20];
+    layer.backgroundColor = fill.CGColor;
+    layer.borderColor = border.CGColor;
+    layer.borderWidth = tahoe ? 0.7 : 0.5;
+    layer.shadowOpacity = dark ? 0.20f : 0.13f;
+    layer.shadowRadius = tahoe ? 5.5 : 4.0;
+    layer.shadowColor = [[NSColor blackColor] colorWithAlphaComponent:dark ? 0.5 : 0.40].CGColor;
+    layer.shadowOffset = CGSizeZero;
+    layer.masksToBounds = YES;
+    layer.shouldRasterize = NO;
+    layer.backgroundFilters = nil;
+    layer.filters = nil;
+    layer.contents = nil;
+    layer.contentsGravity = kCAGravityResize;
+    layer.contentsScale = NSScreen.mainScreen.backingScaleFactor;
 }
 
 static BOOL NDIsGlassWidgetBg(CALayer *sub) {
@@ -706,6 +727,7 @@ static void NDSyncGlassWidget(CALayer *shell, CALayer *bg, CALayer *src, CGRect 
     bg.masksToBounds = YES;
     if (bg.superlayer != shell)
         [shell insertSublayer:bg atIndex:0];
+    bg.zPosition = 0.0;
     NDApplyLiquidGlass(bg);
 
     for (int i = 0; i < rowCount; i++) {
@@ -797,8 +819,8 @@ static void NDSyncMediaWidget(CALayer *shell, CALayer *bg, CALayer *src, CGRect 
     bg.masksToBounds = YES;
     if (bg.superlayer != shell)
         [shell insertSublayer:bg atIndex:0];
-    NDApplyLiquidGlass(bg);
     bg.zPosition = 0.0;
+    NDApplyLiquidGlass(bg);
 
     CALayer *art = gNDMediaArtLayer;
     CALayer *clips[] = { gNDMediaTitleClip, gNDMediaArtistClip };
@@ -1381,11 +1403,11 @@ static CGFloat NDHorizontalMediaContentWidth(void) {
 static CALayer *NDMakeLayerShell(void) {
     CALayer *shell = [CALayer layer];
     shell.contentsScale = NSScreen.mainScreen.backingScaleFactor;
-    shell.masksToBounds = YES;
-    shell.cornerRadius = 10.0;
-    shell.backgroundColor = [[NSColor colorWithWhite:0.10 alpha:kNDWidgetBgAlpha] CGColor];
-    shell.borderColor = [[NSColor colorWithWhite:1.0 alpha:0.28] CGColor];
-    shell.borderWidth = 1.0;
+    shell.masksToBounds = NO;
+    shell.cornerRadius = 0.0;
+    shell.backgroundColor = [[NSColor clearColor] CGColor];
+    shell.borderColor = [[NSColor clearColor] CGColor];
+    shell.borderWidth = 0.0;
     shell.hidden = YES;
     shell.zPosition = 8000.0;
     return shell;
