@@ -11,6 +11,8 @@
 #import <math.h>
 
 void NDWindowMarginInit(void);
+void NDMediaRefreshTextColors(void);
+void NDRefreshDockWidgetTextColors(void);
 
 static const CGFloat kNDMinRealSpan = 50.0;
 static const CGFloat kNDMaxFloorBandPt = 120.0;
@@ -1018,6 +1020,45 @@ static BOOL NDFloorHostUsable(CGRect floorInHost, BOOL horizontal,
     return YES;
 }
 
+static BOOL NDSystemIsDarkAppearance(void) {
+    NSString *style = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleInterfaceStyle"];
+    return [style.lowercaseString isEqualToString:@"dark"];
+}
+
+static NSColor *NDSystemWidgetTextColor(BOOL primary) {
+    NSColor *base = NDSystemIsDarkAppearance() ? [NSColor whiteColor] : [NSColor blackColor];
+    return [base colorWithAlphaComponent:primary ? 0.94 : 0.76];
+}
+
+static id gNDThemeObserver = nil;
+
+static void NDRegisterWidgetThemeObserver(void) {
+    if (gNDThemeObserver) return;
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    NSString *name = @"NSApplicationDidChangeEffectiveAppearanceNotification";
+    gNDThemeObserver = [center addObserverForName:name
+                                            object:NSApp
+                                             queue:[NSOperationQueue mainQueue]
+                                        usingBlock:^(NSNotification *notification) {
+        (void)notification;
+        NDRefreshDockWidgetTextColors();
+    }];
+}
+
+void NDRefreshDockWidgetTextColors(void) {
+    if (gNDDiskLayer) gNDDiskLayer.foregroundColor = NDSystemWidgetTextColor(NO).CGColor;
+    if (gNDRamLayer) gNDRamLayer.foregroundColor = NDSystemWidgetTextColor(NO).CGColor;
+    if (gNDChipLayer) gNDChipLayer.foregroundColor = NDSystemWidgetTextColor(YES).CGColor;
+    if (gNDNetUpLayer) gNDNetUpLayer.foregroundColor = NDSystemWidgetTextColor(NO).CGColor;
+    if (gNDNetDownLayer) gNDNetDownLayer.foregroundColor = NDSystemWidgetTextColor(NO).CGColor;
+    if (gNDMediaTitleLayer) gNDMediaTitleLayer.foregroundColor = NDSystemWidgetTextColor(YES).CGColor;
+    if (gNDMediaArtistLayer) gNDMediaArtistLayer.foregroundColor = NDSystemWidgetTextColor(NO).CGColor;
+    if (gNDMediaPrevLayer) gNDMediaPrevLayer.foregroundColor = NDSystemWidgetTextColor(NO).CGColor;
+    if (gNDMediaPlayLayer) gNDMediaPlayLayer.foregroundColor = NDSystemWidgetTextColor(YES).CGColor;
+    if (gNDMediaNextLayer) gNDMediaNextLayer.foregroundColor = NDSystemWidgetTextColor(NO).CGColor;
+    NDMediaRefreshTextColors();
+}
+
 static CATextLayer *NDMakeText(NSString *text, NSColor *color) {
     CATextLayer *t = [CATextLayer layer];
     t.contentsScale = NSScreen.mainScreen.backingScaleFactor;
@@ -1027,6 +1068,19 @@ static CATextLayer *NDMakeText(NSString *text, NSColor *color) {
     t.foregroundColor = color.CGColor;
     t.alignmentMode = kCAAlignmentLeft;
     t.truncationMode = kCATruncationEnd;
+    t.wrapped = NO;
+    return t;
+}
+
+static CATextLayer *NDMakeMediaButtonText(NSString *text, NSColor *color) {
+    CATextLayer *t = [CATextLayer layer];
+    t.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    t.string = text;
+    t.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:kNDMediaCtrlFontSize weight:NSFontWeightSemibold];
+    t.fontSize = kNDMediaCtrlFontSize;
+    t.foregroundColor = color.CGColor;
+    t.alignmentMode = kCAAlignmentCenter;
+    t.truncationMode = kCATruncationNone;
     t.wrapped = NO;
     return t;
 }
@@ -1133,12 +1187,28 @@ static void NDLayoutNetCompact(CALayer *shell, CGFloat sideInL, CGFloat sideInR)
 }
 
 static void NDApplyMediaHorizCtrlStyle(CATextLayer *row, CGRect frame, CGFloat fontSize);
+static void NDApplyMediaCompactCtrlStyle(CATextLayer *row, CGRect frame, BOOL sideButton);
+
+static void NDRefreshMediaActionButtonColors(void) {
+    if (!gNDMediaPrevLayer && !gNDMediaPlayLayer && !gNDMediaNextLayer) return;
+    if (gNDMediaCompactLayout) {
+        if (gNDMediaPrevLayer) NDApplyMediaCompactCtrlStyle(gNDMediaPrevLayer, gNDMediaPrevLayer.frame, YES);
+        if (gNDMediaPlayLayer) NDApplyMediaCompactCtrlStyle(gNDMediaPlayLayer, gNDMediaPlayLayer.frame, NO);
+        if (gNDMediaNextLayer) NDApplyMediaCompactCtrlStyle(gNDMediaNextLayer, gNDMediaNextLayer.frame, YES);
+        return;
+    }
+
+    CGFloat ctrlFont = gNDHorizCtrlFramesValid ? gNDHorizCtrlFont : MAX(kNDMediaCtrlFontSize, kNDMediaCtrlSideFontSize);
+    CGRect prevFrame = gNDHorizCtrlFramesValid ? gNDHorizCtrlPrev : (gNDMediaPrevLayer ? gNDMediaPrevLayer.frame : CGRectZero);
+    CGRect playFrame = gNDHorizCtrlFramesValid ? gNDHorizCtrlPlay : (gNDMediaPlayLayer ? gNDMediaPlayLayer.frame : CGRectZero);
+    CGRect nextFrame = gNDHorizCtrlFramesValid ? gNDHorizCtrlNext : (gNDMediaNextLayer ? gNDMediaNextLayer.frame : CGRectZero);
+    NDApplyMediaHorizCtrlStyle(gNDMediaPrevLayer, prevFrame, ctrlFont);
+    NDApplyMediaHorizCtrlStyle(gNDMediaPlayLayer, playFrame, ctrlFont);
+    NDApplyMediaHorizCtrlStyle(gNDMediaNextLayer, nextFrame, ctrlFont);
+}
 
 void NDRelayoutMediaHorizControls(void) {
-    if (!gNDHorizCtrlFramesValid || gNDMediaCompactLayout) return;
-    NDApplyMediaHorizCtrlStyle(gNDMediaPrevLayer, gNDHorizCtrlPrev, gNDHorizCtrlFont);
-    NDApplyMediaHorizCtrlStyle(gNDMediaPlayLayer, gNDHorizCtrlPlay, gNDHorizCtrlFont);
-    NDApplyMediaHorizCtrlStyle(gNDMediaNextLayer, gNDHorizCtrlNext, gNDHorizCtrlFont);
+    NDRefreshMediaActionButtonColors();
 }
 
 static void NDApplyHorizMediaControlFrames(CGFloat textX, CGFloat textW, CGFloat ctrlY, CGFloat ctrlH) {
@@ -1156,14 +1226,21 @@ static void NDApplyHorizMediaControlFrames(CGFloat textX, CGFloat textW, CGFloat
 
 static void NDApplyMediaHorizCtrlStyle(CATextLayer *row, CGRect frame, CGFloat fontSize) {
     if (!row) return;
+    if (CGRectIsEmpty(frame)) frame = row.frame;
+    if (CGRectIsEmpty(frame)) frame = CGRectMake(0.0, 0.0, MAX(1.0, row.bounds.size.width), MAX(1.0, row.bounds.size.height));
     NSString *text = nil;
     id cur = row.string;
     if ([cur isKindOfClass:[NSString class]]) text = (NSString *)cur;
     else if ([cur isKindOfClass:[NSAttributedString class]]) text = [(NSAttributedString *)cur string];
     if (!text.length) return;
 
+    // Compute color fresh from the current system appearance — same approach used by
+    // NDApplyMarqueeLine for title/artist, which is the path that works correctly.
+    BOOL isPrimary = (row == gNDMediaPlayLayer);
+    NSColor *color = NDSystemWidgetTextColor(isPrimary);
+
     NSFont *font = [NSFont systemFontOfSize:fontSize weight:NSFontWeightSemibold];
-    CGFloat lineH = frame.size.height;
+    CGFloat lineH = MAX(1.0, frame.size.height);
     NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
     ps.alignment = NSTextAlignmentCenter;
     ps.minimumLineHeight = lineH;
@@ -1171,31 +1248,58 @@ static void NDApplyMediaHorizCtrlStyle(CATextLayer *row, CGRect frame, CGFloat f
 
     CGFloat fontH = font.ascender - font.descender + font.leading;
     CGFloat baselineOffset = floor((lineH - fontH) * 0.5);
-    NSMutableDictionary *attrs = [@{
+    NSDictionary *attrs = @{
         NSFontAttributeName: font,
+        NSForegroundColorAttributeName: color,
         NSParagraphStyleAttributeName: ps,
         NSBaselineOffsetAttributeName: @(baselineOffset),
-    } mutableCopy];
-    if (row.foregroundColor)
-        attrs[NSForegroundColorAttributeName] = [NSColor colorWithCGColor:row.foregroundColor];
+    };
 
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    row.foregroundColor = color.CGColor;
     row.wrapped = NO;
     row.truncationMode = kCATruncationEnd;
     row.alignmentMode = kCAAlignmentCenter;
     row.contentsScale = NSScreen.mainScreen.backingScaleFactor;
     row.string = [[NSAttributedString alloc] initWithString:text attributes:attrs];
     row.frame = frame;
+    [CATransaction commit];
 }
 
 static void NDApplyMediaCompactCtrlStyle(CATextLayer *row, CGRect frame, BOOL sideButton) {
     if (!row) return;
+    if (CGRectIsEmpty(frame)) frame = row.frame;
+    if (CGRectIsEmpty(frame)) frame = CGRectMake(0.0, 0.0, MAX(1.0, row.bounds.size.width), MAX(1.0, row.bounds.size.height));
+
+    // Compute color fresh from the current system appearance.
+    BOOL isPrimary = (row == gNDMediaPlayLayer);
+    NSColor *color = NDSystemWidgetTextColor(isPrimary);
+
+    CGFloat size = sideButton ? kNDMediaCompactCtrlSideFontSize : kNDMediaCompactCtrlFontSize;
+    NSString *text = nil;
+    id cur = row.string;
+    if ([cur isKindOfClass:[NSString class]]) text = (NSString *)cur;
+    else if ([cur isKindOfClass:[NSAttributedString class]]) text = [(NSAttributedString *)cur string];
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    row.foregroundColor = color.CGColor;
     row.wrapped = NO;
     row.truncationMode = kCATruncationEnd;
     row.alignmentMode = kCAAlignmentCenter;
-    CGFloat size = sideButton ? kNDMediaCompactCtrlSideFontSize : kNDMediaCompactCtrlFontSize;
     row.fontSize = size;
     row.font = (__bridge CFTypeRef)[NSFont systemFontOfSize:size weight:NSFontWeightSemibold];
+    if (text.length) {
+        NSAttributedString *attr = [[NSAttributedString alloc] initWithString:text
+                                                                    attributes:@{
+            NSFontAttributeName: [NSFont systemFontOfSize:size weight:NSFontWeightSemibold],
+            NSForegroundColorAttributeName: color,
+        }];
+        row.string = attr;
+    }
     row.frame = frame;
+    [CATransaction commit];
 }
 
 static void NDLayoutMediaHorizontal(CALayer *shell, CGFloat topIn, CGFloat botIn) {
@@ -1290,8 +1394,8 @@ static CALayer *NDMakeLayerShell(void) {
 static void NDEnsureWidgets(void) {
     if (gNDLeftShell) return;
 
-    NSColor *hi = [[NSColor blackColor] colorWithAlphaComponent:0.94];
-    NSColor *lo = [[NSColor blackColor] colorWithAlphaComponent:0.76];
+    NSColor *hi = NDSystemWidgetTextColor(YES);
+    NSColor *lo = NDSystemWidgetTextColor(NO);
 
     gNDLeftShell = NDMakeLayerShell();
     gNDRightShell = NDMakeLayerShell();
@@ -1318,14 +1422,16 @@ static void NDEnsureWidgets(void) {
     gNDMediaArtistLayer = NDMakeText(@"Artist …", lo);
     [gNDMediaTitleClip addSublayer:gNDMediaTitleLayer];
     [gNDMediaArtistClip addSublayer:gNDMediaArtistLayer];
-    gNDMediaPrevLayer = NDMakeText(@"⏮", lo);
-    gNDMediaPlayLayer = NDMakeText(@"▶", hi);
-    gNDMediaNextLayer = NDMakeText(@"⏭", lo);
+    gNDMediaPrevLayer = NDMakeMediaButtonText(@"⏮", lo);
+    gNDMediaPlayLayer = NDMakeMediaButtonText(@"▶", hi);
+    gNDMediaNextLayer = NDMakeMediaButtonText(@"⏭", lo);
 
     NDStatsBindLayers(gNDDiskLayer, gNDRamLayer, gNDChipLayer, gNDNetUpLayer, gNDNetDownLayer);
     NDMediaBindLayers(gNDMediaArtLayer, gNDMediaTitleClip, gNDMediaTitleLayer,
                       gNDMediaArtistClip, gNDMediaArtistLayer,
                       gNDMediaPrevLayer, gNDMediaPlayLayer, gNDMediaNextLayer);
+    NDRegisterWidgetThemeObserver();
+    NDRefreshDockWidgetTextColors();
     NDMediaStart();
     NDStatsStart();
 }
@@ -1485,6 +1591,7 @@ static void NDOnDockGeometryChange(id dockBar) {
 static void NDLayoutWidgets(id dockBar) {
     if (gNDInWidgetLayout) return;
     if (NDShouldSuppressWidgetLayout()) return;
+    NDRefreshDockWidgetTextColors();
     if (!dockBar) dockBar = gNDDockBar;
 
     CALayer *floor = gNDFloorLayerRef;

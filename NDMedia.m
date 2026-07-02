@@ -86,16 +86,28 @@ static CGRect gHitNext = {0};
 static const CGFloat kNDMediaHitSlopPt = 3.0;
 
 static void NDFetchNowPlaying(void);
+static NSColor *NDMediaTextColor(BOOL primary);
+
+static void NDSetTextWithColor(CATextLayer *layer, NSString *text, NSColor *color) {
+    if (!layer || !text || !color) return;
+
+    NSDictionary *attrs = @{
+        NSForegroundColorAttributeName: color,
+        NSFontAttributeName: [NSFont systemFontOfSize:layer.fontSize > 0 ? layer.fontSize : 12.0 weight:NSFontWeightSemibold],
+    };
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    layer.foregroundColor = color.CGColor;
+    layer.string = [[NSAttributedString alloc] initWithString:text attributes:attrs];
+    [CATransaction commit];
+}
 
 static void NDSetText(CATextLayer *layer, NSString *text) {
     if (!layer || !text) return;
-    id cur = layer.string;
-    if ([cur isKindOfClass:[NSString class]] && [(NSString *)cur isEqualToString:text])
-        return;
-    if ([cur isKindOfClass:[NSAttributedString class]]
-        && [[(NSAttributedString *)cur string] isEqualToString:text])
-        return;
-    layer.string = text;
+
+    BOOL isPrimary = (layer == gTitle || layer == gPlay);
+    NSColor *color = NDMediaTextColor(isPrimary);
+    NDSetTextWithColor(layer, text, color);
 }
 
 static NSString *NDMRString(CFDictionaryRef dict, CFStringRef key) {
@@ -242,9 +254,39 @@ static void NDEnsureMarqueeTimer(void) {
     dispatch_resume(gMarqueeTimer);
 }
 
+static BOOL NDSystemIsDarkAppearance(void) {
+    NSString *style = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleInterfaceStyle"];
+    return [style.lowercaseString isEqualToString:@"dark"];
+}
+
 static NSColor *NDMediaTextColor(BOOL primary) {
-    return primary ? [[NSColor blackColor] colorWithAlphaComponent:0.94]
-                 : [[NSColor blackColor] colorWithAlphaComponent:0.76];
+    NSColor *base = NDSystemIsDarkAppearance() ? [NSColor whiteColor] : [NSColor blackColor];
+    return [base colorWithAlphaComponent:primary ? 0.94 : 0.76];
+}
+
+static void NDApplyMarqueePresentation(void);
+
+void NDMediaRefreshTextColors(void) {
+    NSColor *primary = NDMediaTextColor(YES);
+    NSColor *secondary = NDMediaTextColor(NO);
+    if (gTitle) gTitle.foregroundColor = primary.CGColor;
+    if (gArtist) gArtist.foregroundColor = secondary.CGColor;
+    if (gPrev) gPrev.foregroundColor = secondary.CGColor;
+    if (gPlay) gPlay.foregroundColor = primary.CGColor;
+    if (gNext) gNext.foregroundColor = secondary.CGColor;
+
+    if (gTitle || gArtist) {
+        if (gMarqueeFramesValid) {
+            NDApplyMarqueePresentation();
+        } else {
+            NDSetText(gTitle, gHasCache ? (gCachedTitle ?: @"Not Playing") : @"…");
+            NDSetText(gArtist, gHasCache ? (gCachedArtist ?: @"") : @"");
+        }
+    }
+
+    if (gPrev || gPlay || gNext) {
+        NDRelayoutMediaHorizControls();
+    }
 }
 
 static void NDStyleMarqueeText(CATextLayer *layer, NSAttributedString *attr, CGFloat layerW,

@@ -1,6 +1,7 @@
 #import "NDStats.h"
 #import "NDPerf.h"
 #import <Foundation/Foundation.h>
+#import <Cocoa/Cocoa.h>
 #import <sys/sysctl.h>
 #import <sys/mount.h>
 #import <mach/mach.h>
@@ -156,10 +157,28 @@ static void NDSetText(CATextLayer *layer, NSString *text) {
     layer.string = text;
 }
 
+static BOOL NDStatsIsDarkAppearance(void) {
+    NSString *style = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleInterfaceStyle"];
+    return [style.lowercaseString isEqualToString:@"dark"];
+}
+
+static NSColor *NDStatsTextColor(BOOL primary) {
+    NSColor *base = NDStatsIsDarkAppearance() ? [NSColor whiteColor] : [NSColor blackColor];
+    return [base colorWithAlphaComponent:primary ? 0.94 : 0.76];
+}
+
 static void NDRefreshStats(void) {
     if (!gDiskLayer) return;
 
     NDPerfTick();
+
+    NSColor *primary = NDStatsTextColor(YES);
+    NSColor *secondary = NDStatsTextColor(NO);
+    if (gDiskLayer) gDiskLayer.foregroundColor = secondary.CGColor;
+    if (gRamLayer) gRamLayer.foregroundColor = secondary.CGColor;
+    if (gChipLayer) gChipLayer.foregroundColor = primary.CGColor;
+    if (gNetUpLayer) gNetUpLayer.foregroundColor = secondary.CGColor;
+    if (gNetDownLayer) gNetDownLayer.foregroundColor = secondary.CGColor;
 
     uint64_t diskUsed = 0, diskTotal = 0;
     unsigned int diskPct = 0;
